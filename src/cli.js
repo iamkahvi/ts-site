@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 const fs = require("node:fs");
 const fsp = fs.promises;
 const path = require("node:path");
@@ -7,9 +7,6 @@ const http = require("node:http");
 const https = require("node:https");
 const readline = require("node:readline");
 const { assertSiteName, serviceName, siteUrl } = require("./common");
-const { loadEnvFile } = require("./env");
-
-if (require.main === module) loadEnvFile();
 
 const VERSION = require("../package.json").version;
 const HOST_URL = process.env.TS_SITE_HOST_URL || "http://127.0.0.1:8080";

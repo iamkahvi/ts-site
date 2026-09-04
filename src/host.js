@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * The small daemon that runs on m900. It owns site storage and also serves the
  * active release. The API is intentionally JSON-only; the CLI sends a complete
@@ -12,9 +12,6 @@ const crypto = require("node:crypto");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { assertSiteName, serviceName, jsonError } = require("./common");
-const { loadEnvFile } = require("./env");
-
-if (require.main === module) loadEnvFile();
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(process.env.TS_SITE_ROOT || "/srv/sites");

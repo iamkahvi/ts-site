@@ -4,8 +4,8 @@ Deploy private static sites to a tagged Tailscale host.
 
 ## Host setup
 
-The host needs Node.js 18+, Tailscale, and the tag configured by
-`TS_SITE_HOST_TAG` (default: `tag:ts-site-host`).
+The host needs Bun 1.3+, Tailscale, and the tag configured by
+`TS_SITE_HOST_TAG` (default: `tag:ts-site-host`). Bun loads `.env` automatically.
 
 ```sh
 sudo install -d -o ts-site -g ts-site /srv/sites
@@ -30,7 +30,7 @@ networks and always configure a strong API token.
 Start the host from the directory containing `.env`:
 
 ```sh
-node src/host.js
+bun run host
 ```
 
 Run it under systemd for a permanent installation. The service user must be
@@ -41,7 +41,7 @@ able to write `TS_SITE_ROOT` and run the required `tailscale serve` commands.
 Install the command and create its configuration:
 
 ```sh
-npm link
+bun link
 cp .env.example .env
 $EDITOR .env
 ```

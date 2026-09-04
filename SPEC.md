@@ -255,7 +255,7 @@ This would serve `/srv/sites/portfolio/current` directly from the daemon. The `t
 
 ### CLI
 
-- [ ] Choose the implementation language and packaging approach.
+- [x] Use Bun 1.3+ with a linked `ts-site` executable and no runtime dependencies.
 - [ ] Implement `ts-site init`.
 - [ ] Implement `ts-site deploy`.
 - [ ] Implement `ts-site delete` with a confirmation safeguard.
