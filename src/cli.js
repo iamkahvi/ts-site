@@ -7,6 +7,9 @@ const http = require("node:http");
 const https = require("node:https");
 const readline = require("node:readline");
 const { assertSiteName, serviceName, siteUrl } = require("./common");
+const { loadEnvFile } = require("./env");
+
+if (require.main === module) loadEnvFile();
 
 const VERSION = require("../package.json").version;
 const HOST_URL = process.env.TS_SITE_HOST_URL || "http://127.0.0.1:8080";
@@ -14,6 +17,9 @@ const TAILNET = process.env.TS_SITE_TAILNET || "-";
 const API_BASE = (process.env.TS_SITE_API_URL || "https://api.tailscale.com/api/v2/tailnet/") + encodeURIComponent(TAILNET);
 const API_KEY = process.env.TAILSCALE_API_KEY || "";
 const SKIP_TAILSCALE = process.env.TS_SITE_SKIP_TAILSCALE === "1";
+const HOSTNAME = process.env.TS_SITE_HOSTNAME || "m900";
+const HOST_TAG = process.env.TS_SITE_HOST_TAG || "tag:ts-site-host";
+const APPROVAL_TIMEOUT = Number(process.env.TS_SITE_APPROVAL_TIMEOUT || 60_000);
 
 const GENERAL_HELP = `Usage: ts-site <command> [options]
 
@@ -95,8 +101,11 @@ function apiRequest(requestPath, method, body) {
         const raw = Buffer.concat(chunks).toString("utf8");
         let value = {};
         try { value = raw ? JSON.parse(raw) : {}; } catch { value = { message: raw }; }
-        if (res.statusCode < 200 || res.statusCode >= 300) reject(new Error(value.message || value.error || `Tailscale API request failed (${res.statusCode})`));
-        else resolve(value);
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const error = new Error(value.message || value.error || `Tailscale API request failed (${res.statusCode})`);
+          error.status = res.statusCode;
+          reject(error);
+        } else resolve(value);
       });
     });
     req.on("error", (error) => reject(new Error(`Tailscale API connection failed: ${error.message}`)));
@@ -110,24 +119,78 @@ function requireTailscale() {
 
 async function listServices() {
   const response = await apiRequest("services", "GET");
-  return Array.isArray(response) ? response : (response.services || []);
+  return Array.isArray(response.vipServices) ? response.vipServices : [];
+}
+
+function serviceRequestBody(service, addHttps = false) {
+  const body = { name: service.name };
+  const ports = Array.isArray(service.ports) ? service.ports : [];
+  body.ports = addHttps ? [...new Set([...ports, "tcp:443"])] : ports;
+  for (const field of ["displayName", "comment", "tags", "addrs"]) {
+    if (service[field] !== undefined) body[field] = service[field];
+  }
+  return body;
+}
+
+async function putService(service, addHttps = false) {
+  return apiRequest(`services/${encodeURIComponent(service.name)}`, "PUT", serviceRequestBody(service, addHttps));
 }
 
 async function createService(name) {
   const wanted = serviceName(name);
   const existing = (await listServices()).find((item) => item.name === wanted);
-  if (existing) return { service: existing, created: false };
-  return { service: await apiRequest("services", "POST", { name: wanted }), created: true };
+  if (existing?.ports?.includes("tcp:443")) return { service: existing, created: false, previous: null };
+  const service = await putService(existing || { name: wanted, ports: [] }, true);
+  return { service, created: !existing, previous: existing || null };
 }
 
 async function deleteService(name) {
   const wanted = serviceName(name);
-  const existing = (await listServices()).find((item) => item.name === wanted);
-  if (!existing) return;
-  // The API identifies a service by its name in current API versions. Accept
-  // an id when a future response supplies one.
-  const id = existing.id || existing.name || wanted;
-  await apiRequest(`services/${encodeURIComponent(id)}`, "DELETE");
+  try {
+    await apiRequest(`services/${encodeURIComponent(wanted)}`, "DELETE");
+  } catch (error) {
+    if (error.status !== 404) throw error;
+  }
+}
+
+async function discoverHost() {
+  const query = new URLSearchParams({ fields: "all", hostname: HOSTNAME });
+  const response = await apiRequest(`devices?${query}`, "GET");
+  const devices = Array.isArray(response.devices)
+    ? response.devices.filter((device) => device.hostname === HOSTNAME)
+    : [];
+  if (devices.length === 0) fail(`Tailscale host device not found: ${HOSTNAME}`);
+  if (devices.length > 1) fail(`multiple Tailscale devices have hostname ${HOSTNAME}`);
+  const device = devices[0];
+  if (!device.authorized) fail(`Tailscale host device is not authorized: ${HOSTNAME}`);
+  if (!Array.isArray(device.tags) || !device.tags.includes(HOST_TAG)) {
+    fail(`Tailscale host ${HOSTNAME} must have tag ${HOST_TAG}`);
+  }
+  if (!device.nodeId) fail(`Tailscale host ${HOSTNAME} did not return a nodeId`);
+  return device;
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForServiceHost(name, deviceId) {
+  const wanted = serviceName(name);
+  const deadline = Date.now() + APPROVAL_TIMEOUT;
+  let approvalRequested = false;
+  while (Date.now() < deadline) {
+    const response = await apiRequest(`services/${encodeURIComponent(wanted)}/devices`, "GET");
+    const hosts = Array.isArray(response.hosts) ? response.hosts : [];
+    const host = hosts.find((item) => (item.nodeId || item.stableNodeID) === deviceId);
+    if (host?.approvalLevel === "not-approved" && !approvalRequested) {
+      await apiRequest(`services/${encodeURIComponent(wanted)}/device/${encodeURIComponent(deviceId)}/approved`, "POST", { approved: true });
+      approvalRequested = true;
+      continue;
+    }
+    if (host?.approvalLevel?.startsWith("approved:") && host.configured === "ready") return host;
+    await sleep(1_000);
+  }
+  fail(`timed out waiting for ${HOSTNAME} to host ${wanted}`);
 }
 
 async function walkDirectory(directory, relative = "") {
@@ -159,12 +222,21 @@ async function confirmDelete(name, yes) {
 
 async function init(name) {
   assertSiteName(name); requireTailscale();
+  const device = SKIP_TAILSCALE ? null : await discoverHost();
   const createdService = SKIP_TAILSCALE ? null : await createService(name);
+  let siteCreated = false;
   try {
     await hostRequest("api/sites", "POST", { name, configure: !SKIP_TAILSCALE });
+    siteCreated = true;
+    if (!SKIP_TAILSCALE) await waitForServiceHost(name, device.nodeId);
   } catch (error) {
-    // Do not remove a Service that existed before this init attempt.
-    if (createdService?.created) { try { await deleteService(name); } catch { /* preserve original error */ } }
+    if (siteCreated) {
+      try { await hostRequest(`api/sites/${encodeURIComponent(name)}`, "DELETE", { configure: !SKIP_TAILSCALE }); } catch { /* preserve original error */ }
+    }
+    try {
+      if (createdService?.created) await deleteService(name);
+      else if (createdService?.previous) await putService(createdService.previous);
+    } catch { /* preserve original error */ }
     throw error;
   }
   console.log(`Created ${name}`);
@@ -218,4 +290,4 @@ async function main(argv = process.argv.slice(2)) {
 
 if (require.main === module) main().catch((error) => { console.error(`ts-site: ${error.message}`); process.exitCode = 1; });
 
-module.exports = { main, walkDirectory, requestJson };
+module.exports = { main, walkDirectory, requestJson, listServices, createService, deleteService, discoverHost, waitForServiceHost };

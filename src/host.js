@@ -12,6 +12,9 @@ const crypto = require("node:crypto");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { assertSiteName, serviceName, jsonError } = require("./common");
+const { loadEnvFile } = require("./env");
+
+if (require.main === module) loadEnvFile();
 
 const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(process.env.TS_SITE_ROOT || "/srv/sites");
@@ -22,6 +25,7 @@ const API_TOKEN = process.env.TS_SITE_API_TOKEN || "";
 const MAX_BODY = Number(process.env.TS_SITE_MAX_UPLOAD || 100 * 1024 * 1024);
 const CONFIGURE_TAILSCALE = process.env.TS_SITE_CONFIGURE_TAILSCALE === "1";
 const TAILSCALE_BIN = process.env.TS_SITE_TAILSCALE_BIN || "tailscale";
+const ENDPOINT_TARGET = process.env.TS_SITE_ENDPOINT_TARGET || `127.0.0.1:${PORT}`;
 
 function siteDir(name) {
   assertSiteName(name);
@@ -78,7 +82,7 @@ function runTailscale(args) {
 
 async function configureEndpoint(name) {
   if (!CONFIGURE_TAILSCALE) throw new Error("host Tailscale configuration is disabled (set TS_SITE_CONFIGURE_TAILSCALE=1)");
-  await runTailscale(["serve", `--service=${serviceName(name)}`, "--https=443", "127.0.0.1:8080"]);
+  await runTailscale(["serve", `--service=${serviceName(name)}`, "--https=443", ENDPOINT_TARGET]);
 }
 
 async function clearEndpoint(name, required = false) {
@@ -86,7 +90,9 @@ async function clearEndpoint(name, required = false) {
     if (required) throw new Error("host Tailscale configuration is disabled (set TS_SITE_CONFIGURE_TAILSCALE=1)");
     return;
   }
-  await runTailscale(["serve", `--service=${serviceName(name)}`, "off"]);
+  const service = serviceName(name);
+  await runTailscale(["serve", "drain", service]);
+  await runTailscale(["serve", "clear", service]);
 }
 
 async function createSite(name, configure = false) {
@@ -255,4 +261,4 @@ if (require.main === module) {
   }).catch((error) => { console.error(error.message); process.exit(1); });
 }
 
-module.exports = { server, safeRelative, retainReleases, deploy };
+module.exports = { server, safeRelative, retainReleases, deploy, configureEndpoint, clearEndpoint };

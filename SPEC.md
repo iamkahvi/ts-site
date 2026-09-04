@@ -113,7 +113,9 @@ Tailscale Services can be managed programmatically, but the regular `tailscale` 
 
 For `ts-site init <name>`:
 
-1. Create or update the Service with:
+1. Discover the configured host with the Devices API and verify its exact hostname, authorization, `nodeId`, and `tag:ts-site-host` identity.
+
+2. Create or update the Service with:
 
    ```text
    PUT /api/v2/tailnet/{tailnet}/services/svc:<name>
@@ -130,13 +132,11 @@ For `ts-site init <name>`:
 
    The Services API uses PUT for create-or-update; there is no collection-level POST operation.
 
-2. Configure `m900` as the Service host, for example:
+3. Ask the host daemon to create the site storage and configure `m900` as the Service host, for example:
 
    ```bash
    sudo tailscale serve --service=svc:portfolio --https=443 127.0.0.1:8080
    ```
-
-3. Identify `m900` using the Devices API, preferably by exact hostname and the `tag:ts-site-host` tag. The device's preferred `nodeId`/`stableNodeID` is used for subsequent Service-host operations.
 
 4. Poll:
 
@@ -158,7 +158,7 @@ For `ts-site init <name>`:
 
    Continue polling until the Service host is approved and configured.
 
-5. Create the site on the host and return `https://<name>.<tailnet-domain>`.
+5. Return `https://<name>.<tailnet-domain>` only after the Service host is approved and ready.
 
 The Services API returns the Service name and VIP addresses, not an application URL. The hostname convention above must be validated against the live tailnet configuration and the configured `tailnet-domain` before it is presented as a user-facing guarantee.
 
@@ -235,12 +235,12 @@ This would serve `/srv/sites/portfolio/current` directly from the daemon. The `t
 - [x] Apply `tag:ts-site-host` to `m900`.
 - [x] Decide how Tailscale Services are created and managed.
 - [ ] Add Tailscale API credentials with the required Service and device scopes.
-- [ ] Implement Service create/update with `PUT .../services/{serviceName}` and parse the `vipServices` list response.
-- [ ] Discover `m900` through the Devices API and verify its hostname and `tag:ts-site-host` tag.
-- [ ] Configure Service endpoints on `m900` with `tailscale serve --service`.
-- [ ] Poll Service hosts and request per-device Service approval when necessary.
+- [x] Implement Service create/update with `PUT .../services/{serviceName}` and parse the `vipServices` list response.
+- [x] Discover `m900` through the Devices API and verify its hostname and `tag:ts-site-host` tag.
+- [x] Configure Service endpoints on the host with `tailscale serve --service`.
+- [x] Poll Service hosts and request per-device Service approval when necessary.
 - [ ] Configure and document tailnet ACLs so intended tailnet members can reach the Services.
-- [ ] Validate the user-facing Service DNS/URL convention on the live tailnet.
+- [x] Validate the user-facing Service DNS/URL convention on the live tailnet.
 
 ### Host service
 
@@ -269,6 +269,6 @@ This would serve `/srv/sites/portfolio/current` directly from the daemon. The `t
 - [ ] Test that partial uploads are never served.
 - [ ] Test release retention and cleanup.
 - [ ] Test deletion and duplicate/invalid site names.
-- [ ] Test the Tailscale API contract: `vipServices`, PUT create/update, deletion by Service name, host discovery, and approval.
+- [x] Test the Tailscale API contract: `vipServices`, PUT create/update, deletion by Service name, host discovery, and approval.
 - [ ] Test Tailscale access from a device on the tailnet.
 - [ ] Document setup, ACLs, operations, and recovery.
