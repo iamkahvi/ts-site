@@ -69,6 +69,12 @@
   sudo systemctl enable --now ts-site.service
   ```
 
+- **Grant Tailscale Serve control to the daemon user**
+  ```sh
+  sudo tailscale set --operator=ts-site
+  ```
+  This allows the `ts-site` systemd process to run `tailscale serve` without root.
+
 - **Verify the running production daemon**
   ```sh
   systemctl is-active ts-site.service
