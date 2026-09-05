@@ -7,10 +7,6 @@ function assertSiteName(name) {
   return name;
 }
 
-function serviceName(name) {
-  return `svc:${assertSiteName(name)}`;
-}
-
 function siteUrl(name, domain = process.env.TS_SITE_DOMAIN || "tail37572.ts.net") {
   return `https://${assertSiteName(name)}.${domain}`;
 }
@@ -21,4 +17,4 @@ function jsonError(status, message) {
   return error;
 }
 
-module.exports = { NAME_RE, assertSiteName, serviceName, siteUrl, jsonError };
+module.exports = { NAME_RE, assertSiteName, siteUrl, jsonError };

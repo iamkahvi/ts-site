@@ -1,6 +1,24 @@
 # ts-site
 
-Deploy private static sites to a tagged Tailscale host.
+Deploy private static sites to a tagged host. The host daemon owns site
+storage and edge routing; the routing provider is swappable (Tailscale by
+default, Cloudflare etc. later) and holds the only provider credentials.
+The CLI is a thin client for the host API.
+
+## Architecture
+
+```text
+CLI  --HTTP-->  host daemon  --provision/deprovision-->  edge router
+                (storage,             (tailscale.js today;
+                 releases,             cloudflare.js etc. later)
+                 origin serving)
+```
+
+- The origin is plain HTTP on a local port and routes by Host header, so any
+  provider that can route a hostname to `127.0.0.1:<port>` works.
+- The host selects its router with `TS_SITE_ROUTER` (`tailscale` or `none`).
+- The CLI needs only the host URL and the host API token; it never touches
+  provider APIs or holds provider credentials.
 
 ## Host setup
 
@@ -16,16 +34,20 @@ $EDITOR .env
 Set at least these host values:
 
 ```dotenv
+TS_SITE_ROUTER=tailscale
+TAILSCALE_API_KEY=tskey-api-...
 TS_SITE_ROOT=/srv/sites
 TS_SITE_BIND=0.0.0.0
 TS_SITE_PORT=8080
 TS_SITE_API_TOKEN=a-long-random-secret
-TS_SITE_CONFIGURE_TAILSCALE=1
 ```
 
 `0.0.0.0` lets the CLI reach the API through the host's Tailscale address and
 lets the local Service proxy use `127.0.0.1:8080`. Restrict port 8080 to trusted
-networks and always configure a strong API token.
+networks and always configure a strong API token. The Tailscale API key lives
+only here; CLI installations never see it.
+
+For local development without Tailscale, set `TS_SITE_ROUTER=none`.
 
 Start the host from the directory containing `.env`:
 
@@ -49,14 +71,12 @@ $EDITOR .env
 Set at least:
 
 ```dotenv
-TAILSCALE_API_KEY=tskey-api-...
-TS_SITE_TAILNET=-
-TS_SITE_DOMAIN=tail37572.ts.net
-TS_SITE_HOSTNAME=m900
-TS_SITE_HOST_TAG=tag:ts-site-host
 TS_SITE_HOST_URL=http://m900:8080
 TS_SITE_API_TOKEN=a-long-random-secret
 ```
+
+No Tailscale credentials are required; `TS_SITE_API_TOKEN` must match the
+host's value (or be unset on both sides to run without client authentication).
 
 Then initialize, deploy, and delete sites:
 

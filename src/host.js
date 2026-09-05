@@ -1,7 +1,10 @@
 #!/usr/bin/env bun
 /**
- * The small daemon that runs on m900. It owns site storage and also serves the
- * active release. The API is intentionally JSON-only; the CLI sends a complete
+ * The small daemon that runs on m900. It owns site storage, serves the active
+ * release, and orchestrates the configured edge router. The origin is plain
+ * HTTP on a local port and routes by Host header, so the router is swappable
+ * (Tailscale today, Cloudflare etc. later) and holds the only provider
+ * credentials. The API is intentionally JSON-only; clients send a complete
  * manifest, which keeps the MVP free of an archive/multipart dependency.
  */
 const http = require("node:http");
@@ -9,20 +12,15 @@ const fs = require("node:fs");
 const fsp = fs.promises;
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
-const { assertSiteName, serviceName, jsonError } = require("./common");
+const router = require("./routers");
+const { assertSiteName, siteUrl, jsonError } = require("./common");
 
-const execFileAsync = promisify(execFile);
 const ROOT = path.resolve(process.env.TS_SITE_ROOT || "/srv/sites");
 const PORT = Number(process.env.TS_SITE_PORT || 8080);
 const BIND = process.env.TS_SITE_BIND || "127.0.0.1";
 const DOMAIN = process.env.TS_SITE_DOMAIN || "tail37572.ts.net";
 const API_TOKEN = process.env.TS_SITE_API_TOKEN || "";
 const MAX_BODY = Number(process.env.TS_SITE_MAX_UPLOAD || 100 * 1024 * 1024);
-const CONFIGURE_TAILSCALE = process.env.TS_SITE_CONFIGURE_TAILSCALE === "1";
-const TAILSCALE_BIN = process.env.TS_SITE_TAILSCALE_BIN || "tailscale";
-const ENDPOINT_TARGET = process.env.TS_SITE_ENDPOINT_TARGET || `127.0.0.1:${PORT}`;
 
 function siteDir(name) {
   assertSiteName(name);
@@ -73,26 +71,7 @@ function requireApiAuth(req) {
   if (req.headers.authorization !== expected) throw jsonError(401, "missing or invalid API token");
 }
 
-function runTailscale(args) {
-  return execFileAsync(TAILSCALE_BIN, args, { timeout: 30_000, maxBuffer: 1024 * 1024 });
-}
-
-async function configureEndpoint(name) {
-  if (!CONFIGURE_TAILSCALE) throw new Error("host Tailscale configuration is disabled (set TS_SITE_CONFIGURE_TAILSCALE=1)");
-  await runTailscale(["serve", `--service=${serviceName(name)}`, "--https=443", ENDPOINT_TARGET]);
-}
-
-async function clearEndpoint(name, required = false) {
-  if (!CONFIGURE_TAILSCALE) {
-    if (required) throw new Error("host Tailscale configuration is disabled (set TS_SITE_CONFIGURE_TAILSCALE=1)");
-    return;
-  }
-  const service = serviceName(name);
-  await runTailscale(["serve", "drain", service]);
-  await runTailscale(["serve", "clear", service]);
-}
-
-async function createSite(name, configure = false) {
+async function createSite(name) {
   const dir = siteDir(name);
   try {
     // Non-recursive mkdir makes duplicate init requests safe even when they
@@ -102,13 +81,20 @@ async function createSite(name, configure = false) {
     if (error.code === "EEXIST") throw jsonError(409, "site already exists");
     throw error;
   }
-  await fsp.mkdir(path.join(dir, "releases"), { recursive: false, mode: 0o755 });
   try {
-    if (configure) await configureEndpoint(name);
+    await fsp.mkdir(path.join(dir, "releases"), { recursive: false, mode: 0o755 });
+    await router.provision(name);
   } catch (error) {
     await fsp.rm(dir, { recursive: true, force: true });
-    throw new Error(`could not configure Tailscale endpoint: ${error.message}`);
+    throw error;
   }
+}
+
+async function deleteSite(name) {
+  // Deprovision first so traffic stops before the content disappears; drain
+  // failures propagate and leave storage intact for a retry.
+  await router.deprovision(name);
+  await fsp.rm(siteDir(name), { recursive: true, force: true });
 }
 
 function newReleaseId() {
@@ -211,6 +197,14 @@ async function serveSite(req, res, hostname) {
   return true;
 }
 
+// Errors from the router carry no HTTP status of their own; surface their
+// message (e.g. Tailscale API failures) instead of a generic 500.
+function orchestrate(work) {
+  return work().catch((error) => {
+    throw error.status ? error : jsonError(502, error.message);
+  });
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, "http://localhost");
   if (url.pathname === "/healthz" && req.method === "GET") return send(res, 200, { ok: true, service: "ts-site-host" });
@@ -220,24 +214,23 @@ async function handle(req, res) {
     return send(res, 405, "method not allowed\n");
   }
   requireApiAuth(req);
-  const match = url.pathname.match(/^\/api\/sites(?:\/([a-z0-9-]+))?(\/endpoint)?$/);
+  const match = url.pathname.match(/^\/api\/sites(?:\/([a-z0-9-]+))?$/);
   if (!match) return send(res, 404, { error: "not found" });
   const name = match[1];
-  if (req.method === "POST" && name && match[2] === "/endpoint") {
-    assertSiteName(name); await configureEndpoint(name); return send(res, 200, { ok: true });
-  }
   if (req.method === "POST" && !name) {
-    const body = await readJson(req); assertSiteName(body.name); await createSite(body.name, body.configure === true); return send(res, 201, { name: body.name });
+    const body = await readJson(req);
+    assertSiteName(body.name);
+    await orchestrate(() => createSite(body.name));
+    return send(res, 201, { name: body.name, url: siteUrl(body.name) });
   }
   if (req.method === "POST" && name) {
-    const body = await readJson(req); const release = await deploy(name, body.files); return send(res, 201, { name, release, url: `https://${name}.${DOMAIN}` });
+    const body = await readJson(req);
+    const release = await deploy(name, body.files);
+    return send(res, 201, { name, release, url: `https://${name}.${DOMAIN}` });
   }
   if (req.method === "DELETE" && name) {
     assertSiteName(name);
-    const body = await readJson(req);
-    const configure = body.configure === undefined ? CONFIGURE_TAILSCALE : body.configure === true;
-    await clearEndpoint(name, configure);
-    await fsp.rm(siteDir(name), { recursive: true, force: true });
+    await orchestrate(() => deleteSite(name));
     return send(res, 200, { deleted: name });
   }
   return send(res, 405, { error: "method not allowed" });
@@ -247,7 +240,9 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((error) => {
     const status = error.status || 500;
     if (status >= 500) console.error(error.stack || error.message);
-    if (!res.headersSent) send(res, status, { error: status >= 500 ? "internal server error" : error.message });
+    // Only unexpected internal errors are masked; 502 router failures carry
+    // their upstream message so clients see actionable output.
+    if (!res.headersSent) send(res, status, { error: status === 500 ? "internal server error" : error.message });
     else res.destroy();
   });
 });
@@ -282,4 +277,4 @@ if (require.main === module) {
   }).catch((error) => { console.error(error.message); process.exit(1); });
 }
 
-module.exports = { server, safeRelative, retainReleases, deploy, configureEndpoint, clearEndpoint };
+module.exports = { server, safeRelative, retainReleases, deploy, createSite, deleteSite };
