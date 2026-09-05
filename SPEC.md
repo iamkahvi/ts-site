@@ -72,9 +72,9 @@ The Service name must be unique across the tailnet. A collision with an existing
 
 - Require an explicit confirmation or equivalent safeguard.
 - Ask the host to delete the site. The host deprovisions routing first, then removes the site and its retained releases.
-- With the Tailscale router, deprovisioning drains and clears the host endpoint on `m900`, then deletes the Tailscale Service by its name, such as `svc:portfolio`.
+- With the Tailscale router, deprovisioning drains the host endpoint, waits for active responses, clears it, then deletes the Tailscale Service by its name, such as `svc:portfolio`.
 
-An already-missing Service may be treated as an idempotent delete, but failures to drain the endpoint must not be silently ignored.
+Already-missing endpoints and Services are idempotent; other routing failures must not be silently ignored.
 
 ### `ts-site help [command]`
 
@@ -109,11 +109,11 @@ Creating a Tailscale Service does not itself grant users access to it. The tailn
 Routing is isolated from storage behind a small router interface implemented in `src/routers/` and selected on the host by `TS_SITE_ROUTER`:
 
 - `provision(name) -> { url }` is idempotent and resolves once traffic can reach the site.
-- `deprovision(name)` is idempotent, drains traffic first, then removes the route, and must throw on failure rather than ignore it.
+- `deprovision(name, waitForIdle)` is idempotent, drains traffic, awaits active responses, then removes the route, and must throw on failure.
 
 The origin is plain HTTP on a local port and routes requests by Host header (`<name>.<domain>`), so any provider that can route a hostname to `127.0.0.1:<port>` is compatible. `tailscale` is the default router; `none` disables routing for local development. A future Cloudflare router would, for example, create a proxied DNS record and add a tunnel ingress rule mapping `<name>.<domain>` to the origin via the Cloudflare API, with access control handled by Cloudflare Access instead of tailnet ACLs.
 
-The host holds the only provider credentials. The CLI authenticates to the host (Bearer token, optional) and never talks to provider APIs.
+The host holds the only provider credentials. The CLI uses a Bearer token, required with the Tailscale router, and never talks to provider APIs.
 
 ## Tailscale Service lifecycle
 
@@ -123,7 +123,7 @@ For provisioning a site `<name>`:
 
 1. Discover the configured host with the Devices API and verify its exact hostname, authorization, `nodeId`, and `tag:ts-site-host` identity.
 
-2. Create or update the Service with:
+2. Reject machine or Service name collisions, then create the Service with:
 
    ```text
    PUT /api/v2/tailnet/{tailnet}/services/svc:<name>
@@ -172,7 +172,7 @@ The Services API returns the Service name and VIP addresses, not an application 
 
 The `tailscale service` CLI only lists Services. `tailscale serve --service` configures and advertises a Service endpoint from its host. The command can be run directly on `m900`, through a host-side daemon, or over Tailscale SSH.
 
-For `ts-site delete <name>`, drain and clear the host endpoint on `m900`, delete the host-side site data, and then delete the Service by name:
+For `ts-site delete <name>`, drain and clear the host endpoint on `m900`, delete the Service by name, then delete host-side site data:
 
 ```text
 DELETE /api/v2/tailnet/{tailnet}/services/svc:<name>

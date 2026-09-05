@@ -8,6 +8,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
+const { EventEmitter } = require("node:events");
 
 const execFileAsync = promisify(execFile);
 const REPO = path.resolve(__dirname, "..");
@@ -124,8 +125,11 @@ test("init provisions storage and the Tailscale Service end to end", async () =>
     const body = await readBody(req);
     calls.push({ method: req.method, route, query: Object.fromEntries(url.searchParams), body, authorization: req.headers.authorization });
 
-    if (req.method === "GET" && route === "/api/v2/tailnet/-/devices") {
+    if (req.method === "GET" && route === "/api/v2/tailnet/-/devices" && url.searchParams.get("hostname") === "mock-host") {
       return send(res, 200, { devices: [{ hostname: "mock-host", nodeId: "node-1", authorized: true, tags: ["tag:ts-site-host"] }] });
+    }
+    if (req.method === "GET" && route === "/api/v2/tailnet/-/devices" && url.searchParams.get("hostname") === "portfolio") {
+      return send(res, 200, { devices: [] });
     }
     if (req.method === "GET" && route === "/api/v2/tailnet/-/services") return send(res, 200, { vipServices: [] });
     if (req.method === "PUT" && route === "/api/v2/tailnet/-/services/svc:portfolio") {
@@ -192,40 +196,27 @@ test("init provisions storage and the Tailscale Service end to end", async () =>
   }
 });
 
-test("init rolls back storage and restores an existing Service when provisioning fails", async () => {
-  const puts = [];
-  const previous = {
-    name: "svc:portfolio",
-    addrs: ["100.64.0.1", "fd7a:115c:a1e0::1"],
-    ports: ["tcp:80"],
-    comment: "existing service",
-  };
+test("init rejects an existing Service without changing it", async () => {
+  const calls = [];
+  const existing = { name: "svc:portfolio", ports: ["tcp:80"], comment: "unrelated" };
   const api = await listen(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     const route = decodeURIComponent(url.pathname);
-    const body = await readBody(req);
-    if (req.method === "GET" && route.endsWith("/devices")) {
+    calls.push({ method: req.method, route, hostname: url.searchParams.get("hostname") });
+    if (req.method === "GET" && route.endsWith("/devices") && url.searchParams.get("hostname") === "mock-host") {
       return send(res, 200, { devices: [{ hostname: "mock-host", nodeId: "node-1", authorized: true, tags: ["tag:ts-site-host"] }] });
     }
-    if (req.method === "GET" && route.endsWith("/services")) return send(res, 200, { vipServices: [previous] });
-    if (req.method === "PUT" && route.endsWith("/services/svc:portfolio")) {
-      puts.push(body);
-      return send(res, 200, body);
-    }
-    return send(res, 404, { message: "unexpected route" });
+    if (req.method === "GET" && route.endsWith("/devices")) return send(res, 200, { devices: [] });
+    if (req.method === "GET" && route.endsWith("/services")) return send(res, 200, { vipServices: [existing] });
+    return send(res, 500, { message: "collision must not be modified" });
   });
 
   const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
-  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", "#!/bin/sh\necho \"serve exploded\" >&2\nexit 1\n");
-
+  const log = path.join(binRoot, "calls.log");
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\n`);
   const host = await startHost({
-    TS_SITE_ROUTER: "tailscale",
-    TAILSCALE_API_KEY: "test-api-key",
-    TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`,
-    TS_SITE_TAILNET: "-",
-    TS_SITE_HOSTNAME: "mock-host",
-    TS_SITE_HOST_TAG: "tag:ts-site-host",
-    TS_SITE_APPROVAL_TIMEOUT: "5000",
+    TS_SITE_ROUTER: "tailscale", TAILSCALE_API_KEY: "test-api-key",
+    TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`, TS_SITE_HOSTNAME: "mock-host",
     TS_SITE_TAILSCALE_BIN: fakeTailscale,
   });
 
@@ -235,14 +226,102 @@ test("init rolls back storage and restores an existing Service when provisioning
       headers: { authorization: "Bearer host-token", "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
-    assert.equal(response.status, 502);
-    const body = await response.json();
-    assert.match(body.error, /serve exploded/);
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /Service.*already exists/i);
+    assert.equal(calls.some((call) => call.method === "PUT"), false);
+    assert.equal(await fsp.readFile(log, "utf8").catch(() => ""), "");
+    await assert.rejects(fsp.stat(path.join(host.root, "portfolio")), (error) => error.code === "ENOENT");
+  } finally {
+    await Promise.all([close(api.server), host.stop()]);
+    await fsp.rm(binRoot, { recursive: true, force: true });
+    await fsp.rm(host.root, { recursive: true, force: true });
+  }
+});
 
-    assert.deepEqual(puts, [
-      { ...previous, ports: ["tcp:80", "tcp:443"] },
-      previous,
+test("init rejects a machine-name collision before checking Services", async () => {
+  const calls = [];
+  const api = await listen(async (req, res) => {
+    const url = new URL(req.url, "http://localhost");
+    const route = decodeURIComponent(url.pathname);
+    calls.push({ method: req.method, route, hostname: url.searchParams.get("hostname") });
+    if (req.method === "GET" && route.endsWith("/devices") && url.searchParams.get("hostname") === "mock-host") {
+      return send(res, 200, { devices: [{ hostname: "mock-host", nodeId: "node-1", authorized: true, tags: ["tag:ts-site-host"] }] });
+    }
+    if (req.method === "GET" && route.endsWith("/devices") && url.searchParams.get("hostname") === "portfolio") {
+      return send(res, 200, { devices: [{ hostname: "portfolio", nodeId: "node-2", authorized: true }] });
+    }
+    if (req.method === "GET" && route.endsWith("/services")) return send(res, 200, { vipServices: [] });
+    return send(res, 500, { message: "unexpected mutation" });
+  });
+
+  const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
+  const log = path.join(binRoot, "calls.log");
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\n`);
+  const host = await startHost({
+    TS_SITE_ROUTER: "tailscale", TAILSCALE_API_KEY: "test-api-key",
+    TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`, TS_SITE_HOSTNAME: "mock-host",
+    TS_SITE_TAILSCALE_BIN: fakeTailscale,
+  });
+
+  try {
+    const response = await fetch(`${host.url}/api/sites`, {
+      method: "POST",
+      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      body: JSON.stringify({ name: "portfolio" }),
+    });
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /machine.*already exists/i);
+    assert.equal(calls.some((call) => call.route.endsWith("/services")), false);
+    assert.equal(await fsp.readFile(log, "utf8").catch(() => ""), "");
+  } finally {
+    await Promise.all([close(api.server), host.stop()]);
+    await fsp.rm(binRoot, { recursive: true, force: true });
+    await fsp.rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("failed init clears the local endpoint before deleting the new Service", async () => {
+  const apiCalls = [];
+  const api = await listen(async (req, res) => {
+    const url = new URL(req.url, "http://localhost");
+    const route = decodeURIComponent(url.pathname);
+    apiCalls.push(`${req.method} ${route}`);
+    if (req.method === "GET" && route.endsWith("/devices") && url.searchParams.get("hostname") === "mock-host") {
+      return send(res, 200, { devices: [{ hostname: "mock-host", nodeId: "node-1", authorized: true, tags: ["tag:ts-site-host"] }] });
+    }
+    if (req.method === "GET" && route.endsWith("/devices")) return send(res, 200, { devices: [] });
+    if (req.method === "GET" && route.endsWith("/services")) return send(res, 200, { vipServices: [] });
+    if (req.method === "PUT" && route.endsWith("/services/svc:portfolio")) return send(res, 200, { name: "svc:portfolio", ports: ["tcp:443"] });
+    if (req.method === "GET" && route.endsWith("/services/svc:portfolio/devices")) return send(res, 200, { hosts: [] });
+    if (req.method === "DELETE" && route.endsWith("/services/svc:portfolio")) return send(res, 200);
+    return send(res, 404, { message: "unexpected route" });
+  });
+
+  const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
+  const log = path.join(binRoot, "calls.log");
+  const config = JSON.stringify({ version: "0.0.1", services: { "svc:portfolio": { endpoints: { "tcp:443": "http://127.0.0.1:8080" } } } });
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nif [ "$*" = "serve get-config --all" ]; then printf '%s\\n' '${config}'; fi\n`);
+  const host = await startHost({
+    TS_SITE_ROUTER: "tailscale", TAILSCALE_API_KEY: "test-api-key",
+    TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`, TS_SITE_HOSTNAME: "mock-host",
+    TS_SITE_APPROVAL_TIMEOUT: "20", TS_SITE_TAILSCALE_BIN: fakeTailscale,
+  });
+
+  try {
+    const response = await fetch(`${host.url}/api/sites`, {
+      method: "POST",
+      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      body: JSON.stringify({ name: "portfolio" }),
+    });
+    assert.equal(response.status, 502);
+    assert.match((await response.json()).error, /timed out/);
+    assert.deepEqual((await fsp.readFile(log, "utf8")).trim().split("\n"), [
+      `serve --service=svc:portfolio --https=443 127.0.0.1:${host.port}`,
+      "serve get-config --all",
+      "serve drain svc:portfolio",
+      "serve clear svc:portfolio",
     ]);
+    assert.equal(apiCalls.at(-1), "DELETE /api/v2/tailnet/-/services/svc:portfolio");
     await assert.rejects(fsp.stat(path.join(host.root, "portfolio")), (error) => error.code === "ENOENT");
   } finally {
     await Promise.all([close(api.server), host.stop()]);
@@ -260,7 +339,8 @@ test("delete drains the endpoint, removes storage, and tolerates an absent Servi
 
   const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
   const log = path.join(binRoot, "calls.log");
-  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\n`);
+  const config = JSON.stringify({ version: "0.0.1", services: { "svc:portfolio": { endpoints: { "tcp:443": "http://127.0.0.1:8080" } } } });
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nif [ "$*" = "serve get-config --all" ]; then printf '%s\\n' '${config}'; fi\n`);
 
   const host = await startHost({
     TS_SITE_ROUTER: "tailscale",
@@ -280,6 +360,7 @@ test("delete drains the endpoint, removes storage, and tolerates an absent Servi
     assert.deepEqual(await response.json(), { deleted: "portfolio" });
 
     assert.equal((await fsp.readFile(log, "utf8")).trim().split("\n").join("\n"), [
+      "serve get-config --all",
       "serve drain svc:portfolio",
       "serve clear svc:portfolio",
     ].join("\n"));
@@ -294,7 +375,8 @@ test("delete drains the endpoint, removes storage, and tolerates an absent Servi
 
 test("delete keeps storage and fails loudly when the router cannot drain", async () => {
   const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
-  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", "#!/bin/sh\necho \"drain exploded\" >&2\nexit 1\n");
+  const config = JSON.stringify({ version: "0.0.1", services: { "svc:portfolio": { endpoints: { "tcp:443": "http://127.0.0.1:8080" } } } });
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nif [ "$*" = "serve get-config --all" ]; then printf '%s\\n' '${config}'; exit 0; fi\necho "drain exploded" >&2\nexit 1\n`);
 
   const host = await startHost({
     TS_SITE_ROUTER: "tailscale",
@@ -315,6 +397,149 @@ test("delete keeps storage and fails loudly when the router cannot drain", async
     await host.stop();
     await fsp.rm(binRoot, { recursive: true, force: true });
     await fsp.rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("delete refuses to deprovision a site not owned by this host", async () => {
+  const apiCalls = [];
+  const api = await listen(async (req, res) => {
+    apiCalls.push(`${req.method} ${req.url}`);
+    return send(res, 200);
+  });
+  const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
+  const log = path.join(binRoot, "calls.log");
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\n`);
+  const host = await startHost({
+    TS_SITE_ROUTER: "tailscale", TAILSCALE_API_KEY: "test-api-key",
+    TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`, TS_SITE_TAILSCALE_BIN: fakeTailscale,
+  });
+
+  try {
+    const response = await fetch(`${host.url}/api/sites/portfolio`, {
+      method: "DELETE", headers: { authorization: "Bearer host-token" },
+    });
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: "site not found" });
+    assert.equal(await fsp.readFile(log, "utf8").catch(() => ""), "");
+    assert.deepEqual(apiCalls, []);
+  } finally {
+    await Promise.all([close(api.server), host.stop()]);
+    await fsp.rm(binRoot, { recursive: true, force: true });
+    await fsp.rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("delete skips an absent local endpoint and remains retry-safe", async () => {
+  const apiCalls = [];
+  const api = await listen(async (req, res) => {
+    apiCalls.push(`${req.method} ${decodeURIComponent(new URL(req.url, "http://localhost").pathname)}`);
+    return send(res, 200);
+  });
+  const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
+  const log = path.join(binRoot, "calls.log");
+  const config = JSON.stringify({ version: "0.0.1", services: {} });
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf '%s\\n' "$*" >> "${log}"\nif [ "$*" = "serve get-config --all" ]; then printf '%s\\n' '${config}'; fi\n`);
+  const host = await startHost({
+    TS_SITE_ROUTER: "tailscale", TAILSCALE_API_KEY: "test-api-key",
+    TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`, TS_SITE_TAILSCALE_BIN: fakeTailscale,
+  });
+
+  try {
+    await fsp.mkdir(path.join(host.root, "portfolio", "releases"), { recursive: true });
+    const response = await fetch(`${host.url}/api/sites/portfolio`, {
+      method: "DELETE", headers: { authorization: "Bearer host-token" },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await fsp.readFile(log, "utf8")).trim(), "serve get-config --all");
+    assert.deepEqual(apiCalls, ["DELETE /api/v2/tailnet/-/services/svc:portfolio"]);
+    await assert.rejects(fsp.stat(path.join(host.root, "portfolio")), (error) => error.code === "ENOENT");
+  } finally {
+    await Promise.all([close(api.server), host.stop()]);
+    await fsp.rm(binRoot, { recursive: true, force: true });
+    await fsp.rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("deprovision waits for origin idle between drain and clear", async () => {
+  const api = await listen(async (_req, res) => send(res, 200));
+  const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
+  const log = path.join(binRoot, "calls.log");
+  const config = JSON.stringify({ version: "0.0.1", services: { "svc:portfolio": { endpoints: { "tcp:443": "http://127.0.0.1:8080" } } } });
+  const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", `#!/bin/sh\nprintf 'CMD %s\\n' "$*" >> "${log}"\nif [ "$*" = "serve get-config --all" ]; then printf '%s\\n' '${config}'; fi\n`);
+  const script = `const fs = require("node:fs"); const router = require("./src/routers/tailscale"); router.deprovision("portfolio", async () => fs.appendFileSync(process.env.TEST_LOG, "WAIT\\n")).catch((error) => { console.error(error); process.exit(1); });`;
+  const child = spawn(process.execPath, ["-e", script], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      TAILSCALE_API_KEY: "test-api-key",
+      TS_SITE_API_URL: `${api.url}/api/v2/tailnet/`,
+      TS_SITE_TAILNET: "-",
+      TS_SITE_TAILSCALE_BIN: fakeTailscale,
+      TEST_LOG: log,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  try {
+    const code = await new Promise((resolve) => child.once("exit", resolve));
+    assert.equal(code, 0, stderr);
+    assert.deepEqual((await fsp.readFile(log, "utf8")).trim().split("\n"), [
+      "CMD serve get-config --all",
+      "CMD serve drain svc:portfolio",
+      "WAIT",
+      "CMD serve clear svc:portfolio",
+    ]);
+  } finally {
+    await close(api.server);
+    if (child.exitCode === null) child.kill("SIGTERM");
+    await fsp.rm(binRoot, { recursive: true, force: true });
+  }
+});
+
+test("origin idle tracking waits for active responses", async () => {
+  const { trackSiteRequest, waitForSiteIdle } = require("../src/host");
+  const response = new EventEmitter();
+  trackSiteRequest("portfolio", response);
+  let resolved = false;
+  const waiting = waitForSiteIdle("portfolio", 1_000).then(() => { resolved = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(resolved, false);
+  response.emit("finish");
+  await waiting;
+  assert.equal(resolved, true);
+});
+
+test("Tailscale mode refuses to start without host API authentication", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-host-"));
+  const child = spawn(process.execPath, ["src/host.js"], {
+    cwd: REPO,
+    env: {
+      ...process.env,
+      TS_SITE_ROOT: root,
+      TS_SITE_BIND: "127.0.0.1",
+      TS_SITE_PORT: "0",
+      TS_SITE_ROUTER: "tailscale",
+      TS_SITE_API_TOKEN: "",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  let timer;
+  try {
+    const code = await Promise.race([
+      new Promise((resolve) => child.once("exit", resolve)),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("host remained running without TS_SITE_API_TOKEN")), 2_000); }),
+    ]);
+    assert.notEqual(code, 0);
+    assert.match(stderr, /TS_SITE_API_TOKEN is required/);
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null) child.kill("SIGTERM");
+    await fsp.rm(root, { recursive: true, force: true });
   }
 });
 

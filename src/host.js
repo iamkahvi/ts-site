@@ -21,6 +21,32 @@ const BIND = process.env.TS_SITE_BIND || "127.0.0.1";
 const DOMAIN = process.env.TS_SITE_DOMAIN || "tail37572.ts.net";
 const API_TOKEN = process.env.TS_SITE_API_TOKEN || "";
 const MAX_BODY = Number(process.env.TS_SITE_MAX_UPLOAD || 100 * 1024 * 1024);
+const DRAIN_TIMEOUT = Number(process.env.TS_SITE_DRAIN_TIMEOUT || 30_000);
+const activeSiteRequests = new Map();
+
+function trackSiteRequest(name, res) {
+  activeSiteRequests.set(name, (activeSiteRequests.get(name) || 0) + 1);
+  let active = true;
+  const finish = () => {
+    if (!active) return;
+    active = false;
+    res.off("finish", finish);
+    res.off("close", finish);
+    const remaining = (activeSiteRequests.get(name) || 1) - 1;
+    if (remaining > 0) activeSiteRequests.set(name, remaining);
+    else activeSiteRequests.delete(name);
+  };
+  res.once("finish", finish);
+  res.once("close", finish);
+}
+
+async function waitForSiteIdle(name, timeout = DRAIN_TIMEOUT) {
+  const deadline = Date.now() + timeout;
+  while (activeSiteRequests.has(name)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for active requests to ${name}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function siteDir(name) {
   assertSiteName(name);
@@ -91,9 +117,16 @@ async function createSite(name) {
 }
 
 async function deleteSite(name) {
-  // Deprovision first so traffic stops before the content disappears; drain
-  // failures propagate and leave storage intact for a retry.
-  await router.deprovision(name);
+  const releases = path.join(siteDir(name), "releases");
+  try {
+    await fsp.access(releases);
+  } catch (error) {
+    if (error.code === "ENOENT") throw jsonError(404, "site not found");
+    throw error;
+  }
+  // Deprovision first so traffic stops before the content disappears. The
+  // router drains, waits for active responses, then clears the endpoint.
+  await router.deprovision(name, () => waitForSiteIdle(name));
   await fsp.rm(siteDir(name), { recursive: true, force: true });
 }
 
@@ -177,6 +210,7 @@ async function serveSite(req, res, hostname) {
   if (!hostname.endsWith(suffix)) return false;
   const name = hostname.slice(0, -suffix.length);
   try { assertSiteName(name); } catch { return false; }
+  trackSiteRequest(name, res);
   let requestPath;
   try { requestPath = decodeURIComponent(new URL(req.url, "http://localhost").pathname); } catch { send(res, 400, "bad URL"); return true; }
   if (requestPath.includes("\0")) { send(res, 400, "bad URL"); return true; }
@@ -264,6 +298,11 @@ function isHostAlreadyRunning() {
 }
 
 if (require.main === module) {
+  const selectedRouter = process.env.TS_SITE_ROUTER || "tailscale";
+  if (selectedRouter === "tailscale" && !API_TOKEN) {
+    console.error("TS_SITE_API_TOKEN is required when TS_SITE_ROUTER=tailscale");
+    process.exit(1);
+  }
   fsp.mkdir(ROOT, { recursive: true }).then(() => {
     server.once("error", async (error) => {
       if (error.code === "EADDRINUSE" && await isHostAlreadyRunning()) {
@@ -277,4 +316,7 @@ if (require.main === module) {
   }).catch((error) => { console.error(error.message); process.exit(1); });
 }
 
-module.exports = { server, safeRelative, retainReleases, deploy, createSite, deleteSite };
+module.exports = {
+  server, safeRelative, retainReleases, deploy, createSite, deleteSite,
+  trackSiteRequest, waitForSiteIdle,
+};

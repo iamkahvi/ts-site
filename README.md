@@ -27,7 +27,7 @@ The host needs Bun 1.3+, Tailscale, and the tag configured by
 
 ```sh
 sudo install -d -o ts-site -g ts-site /srv/sites
-cp .env.example .env
+cp .env.host.example .env
 $EDITOR .env
 ```
 
@@ -64,7 +64,7 @@ Install the command and create its configuration:
 
 ```sh
 bun link
-cp .env.example .env
+cp .env.client.example .env
 $EDITOR .env
 ```
 
@@ -76,7 +76,7 @@ TS_SITE_API_TOKEN=a-long-random-secret
 ```
 
 No Tailscale credentials are required; `TS_SITE_API_TOKEN` must match the
-host's value (or be unset on both sides to run without client authentication).
+host's value. Authentication may be omitted only with `TS_SITE_ROUTER=none`.
 
 Then initialize, deploy, and delete sites:
 

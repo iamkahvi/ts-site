@@ -62,6 +62,20 @@ async function listServices() {
   return Array.isArray(response.vipServices) ? response.vipServices : [];
 }
 
+async function listDevicesByHostname(hostname, fields) {
+  const query = new URLSearchParams({ ...(fields ? { fields } : {}), hostname });
+  const response = await apiRequest(`devices?${query}`, "GET");
+  return Array.isArray(response.devices)
+    ? response.devices.filter((device) => device.hostname === hostname)
+    : [];
+}
+
+function collisionError(message) {
+  const error = new Error(message);
+  error.status = 409;
+  return error;
+}
+
 function serviceRequestBody(service, addHttps = false) {
   const body = { name: service.name };
   const ports = Array.isArray(service.ports) ? service.ports : [];
@@ -78,10 +92,11 @@ async function putService(service, addHttps = false) {
 
 async function createService(name) {
   const wanted = serviceName(name);
+  const machines = await listDevicesByHostname(name);
+  if (machines.length > 0) throw collisionError(`Tailscale machine ${name} already exists`);
   const existing = (await listServices()).find((item) => item.name === wanted);
-  if (existing?.ports?.includes("tcp:443")) return { service: existing, created: false, previous: null };
-  const service = await putService(existing || { name: wanted, ports: [] }, true);
-  return { service, created: !existing, previous: existing || null };
+  if (existing) throw collisionError(`Tailscale Service ${wanted} already exists`);
+  return { service: await putService({ name: wanted, ports: [] }, true), created: true };
 }
 
 async function deleteService(name) {
@@ -94,11 +109,7 @@ async function deleteService(name) {
 }
 
 async function discoverHost() {
-  const query = new URLSearchParams({ fields: "all", hostname: HOSTNAME });
-  const response = await apiRequest(`devices?${query}`, "GET");
-  const devices = Array.isArray(response.devices)
-    ? response.devices.filter((device) => device.hostname === HOSTNAME)
-    : [];
+  const devices = await listDevicesByHostname(HOSTNAME, "all");
   if (devices.length === 0) throw new Error(`Tailscale host device not found: ${HOSTNAME}`);
   if (devices.length > 1) throw new Error(`multiple Tailscale devices have hostname ${HOSTNAME}`);
   const device = devices[0];
@@ -137,6 +148,27 @@ function runTailscale(args) {
   return execFileAsync(TAILSCALE_BIN, args, { timeout: 30_000, maxBuffer: 1024 * 1024 });
 }
 
+async function getServeConfig() {
+  const { stdout } = await runTailscale(["serve", "get-config", "--all"]);
+  try {
+    const config = JSON.parse(stdout);
+    if (!config || typeof config !== "object") throw new Error("configuration is not an object");
+    return config;
+  } catch (error) {
+    throw new Error(`could not parse tailscale serve configuration: ${error.message}`);
+  }
+}
+
+async function removeEndpointIfConfigured(name, waitForIdle = async () => {}) {
+  const service = serviceName(name);
+  const config = await getServeConfig();
+  if (!config.services || !Object.prototype.hasOwnProperty.call(config.services, service)) return false;
+  await runTailscale(["serve", "drain", service]);
+  await waitForIdle();
+  await runTailscale(["serve", "clear", service]);
+  return true;
+}
+
 async function configureEndpoint(name) {
   await runTailscale(["serve", `--service=${serviceName(name)}`, "--https=443", ENDPOINT_TARGET]);
 }
@@ -151,19 +183,20 @@ async function provision(name) {
     await waitForServiceHost(name, device.nodeId);
   } catch (error) {
     try {
+      await removeEndpointIfConfigured(name);
       if (service.created) await deleteService(name);
-      else if (service.previous) await putService(service.previous);
-    } catch { /* preserve original error */ }
+    } catch { /* preserve the provisioning error; leave failed rollback state recoverable */ }
     throw error;
   }
   return { url: siteUrl(name) };
 }
 
-async function deprovision(name) {
-  const service = serviceName(name);
-  await runTailscale(["serve", "drain", service]);
-  await runTailscale(["serve", "clear", service]);
+async function deprovision(name, waitForIdle) {
+  await removeEndpointIfConfigured(name, waitForIdle);
   await deleteService(name);
 }
 
-module.exports = { provision, deprovision, apiRequest, listServices, createService, deleteService, discoverHost, waitForServiceHost };
+module.exports = {
+  provision, deprovision, apiRequest, listServices, createService, deleteService,
+  discoverHost, waitForServiceHost, getServeConfig, removeEndpointIfConfigured,
+};
