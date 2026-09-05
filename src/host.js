@@ -40,12 +40,12 @@ function safeRelative(file) {
   return normalized;
 }
 
-async function readJson(req) {
+async function readJson(req, maxSize = MAX_BODY) {
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY) throw jsonError(413, "request is too large");
+    if (size > maxSize) throw jsonError(413, "request is too large");
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
@@ -213,7 +213,7 @@ async function serveSite(req, res, hostname) {
 
 async function handle(req, res) {
   const url = new URL(req.url, "http://localhost");
-  if (url.pathname === "/healthz" && req.method === "GET") return send(res, 200, { ok: true });
+  if (url.pathname === "/healthz" && req.method === "GET") return send(res, 200, { ok: true, service: "ts-site-host" });
   const hostname = (req.headers.host || "").split(":")[0].toLowerCase();
   if (!url.pathname.startsWith("/api/")) {
     if (req.method === "GET" || req.method === "HEAD") return serveSite(req, res, hostname);
@@ -252,8 +252,32 @@ const server = http.createServer((req, res) => {
   });
 });
 
+function isHostAlreadyRunning() {
+  const host = BIND === "0.0.0.0" ? "127.0.0.1" : BIND === "::" ? "::1" : BIND;
+  return new Promise((resolve) => {
+    const req = http.get({ host, port: PORT, path: "/healthz", timeout: 1000 }, (res) => {
+      readJson(res, 4096).then((health) => {
+        // Accept the old health response so an already-running host can be
+        // recognized while it is being upgraded to this version.
+        resolve(res.statusCode === 200 && health.ok === true &&
+          (health.service === undefined || health.service === "ts-site-host"));
+      }).catch(() => resolve(false));
+    });
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => resolve(false));
+  });
+}
+
 if (require.main === module) {
   fsp.mkdir(ROOT, { recursive: true }).then(() => {
+    server.once("error", async (error) => {
+      if (error.code === "EADDRINUSE" && await isHostAlreadyRunning()) {
+        console.log("ts-site host is already running");
+        process.exit(0);
+      }
+      console.error(error.message);
+      process.exit(1);
+    });
     server.listen(PORT, BIND, () => console.log(`ts-site host listening on ${BIND}:${PORT}, storage ${ROOT}`));
   }).catch((error) => { console.error(error.message); process.exit(1); });
 }
