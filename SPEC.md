@@ -51,12 +51,10 @@ Examples:
 ### `ts-site init <name>`
 
 - Validate the site name and reject invalid or duplicate site names.
-- Create or update its Tailscale Service, such as `svc:portfolio`, using the Services API.
-- Define the Service's HTTPS listener as `tcp:443`.
-- Configure `m900` as the Service host.
-- Discover the `m900` device and wait for it to be configured and approved for the Service, requesting approval when necessary.
-- Create the site on the hosting machine and prepare storage for releases.
-- Return the site URL.
+- Ask the host to create the site. The host creates storage for releases, then provisions routing through its configured edge router (Tailscale by default).
+- With the Tailscale router, provisioning creates or updates the Tailscale Service, such as `svc:portfolio`, using the Services API; defines the Service's HTTPS listener as `tcp:443`; configures `m900` as the Service host via `tailscale serve --service`; and waits for the Service to be approved and ready, requesting approval when necessary.
+- Provisioning failures roll back the created storage and restore the previous Service definition.
+- Return the site URL reported by the router.
 
 The Service name must be unique across the tailnet. A collision with an existing machine name or an existing Service is an error unless it is the same site being initialized.
 
@@ -73,11 +71,10 @@ The Service name must be unique across the tailnet. A collision with an existing
 ### `ts-site delete <name>`
 
 - Require an explicit confirmation or equivalent safeguard.
-- Drain and clear the host endpoint on `m900`.
-- Delete the site and its retained releases from the host.
-- Delete the Tailscale Service by its name, such as `svc:portfolio`.
+- Ask the host to delete the site. The host deprovisions routing first, then removes the site and its retained releases.
+- With the Tailscale router, deprovisioning drains the host endpoint, waits for active responses, clears it, then deletes the Tailscale Service by its name, such as `svc:portfolio`.
 
-An already-missing Service may be treated as an idempotent delete, but failures to clear the host endpoint must not be silently ignored.
+Already-missing endpoints and Services are idempotent; other routing failures must not be silently ignored.
 
 ### `ts-site help [command]`
 
@@ -107,15 +104,26 @@ Sites are intended to be available to anyone on the tailnet. No per-site user or
 
 Creating a Tailscale Service does not itself grant users access to it. The tailnet policy/ACL must permit tailnet members to reach the Service on its HTTPS port. This is an installation prerequisite and is not created implicitly by `ts-site init`.
 
+## Edge routing
+
+Routing is isolated from storage behind a small router interface implemented in `src/routers/` and selected on the host by `TS_SITE_ROUTER`:
+
+- `provision(name) -> { url }` is idempotent and resolves once traffic can reach the site.
+- `deprovision(name, waitForIdle)` is idempotent, drains traffic, awaits active responses, then removes the route, and must throw on failure.
+
+The origin is plain HTTP on a local port and routes requests by Host header (`<name>.<domain>`), so any provider that can route a hostname to `127.0.0.1:<port>` is compatible. `tailscale` is the default router; `none` disables routing for local development. A future Cloudflare router would, for example, create a proxied DNS record and add a tunnel ingress rule mapping `<name>.<domain>` to the origin via the Cloudflare API, with access control handled by Cloudflare Access instead of tailnet ACLs.
+
+The host holds the only provider credentials. The CLI uses a Bearer token, required with the Tailscale router, and never talks to provider APIs.
+
 ## Tailscale Service lifecycle
 
-Tailscale Services can be managed programmatically, but the regular `tailscale` CLI does not create the Service definition. `ts-site` will use the Tailscale API for control-plane work and the Tailscale CLI on `m900` for local endpoint configuration.
+This section describes the Tailscale router (`src/routers/tailscale.js`), which runs inside the host daemon. Tailscale Services can be managed programmatically, but the regular `tailscale` CLI does not create the Service definition, so the router uses the Tailscale API for control-plane work and the Tailscale CLI on `m900` for local endpoint configuration.
 
-For `ts-site init <name>`:
+For provisioning a site `<name>`:
 
 1. Discover the configured host with the Devices API and verify its exact hostname, authorization, `nodeId`, and `tag:ts-site-host` identity.
 
-2. Create or update the Service with:
+2. Reject machine or Service name collisions, then create the Service with:
 
    ```text
    PUT /api/v2/tailnet/{tailnet}/services/svc:<name>
@@ -164,13 +172,13 @@ The Services API returns the Service name and VIP addresses, not an application 
 
 The `tailscale service` CLI only lists Services. `tailscale serve --service` configures and advertises a Service endpoint from its host. The command can be run directly on `m900`, through a host-side daemon, or over Tailscale SSH.
 
-For `ts-site delete <name>`, drain and clear the host endpoint on `m900`, delete the host-side site data, and then delete the Service by name:
+For `ts-site delete <name>`, drain and clear the host endpoint on `m900`, delete the Service by name, then delete host-side site data:
 
 ```text
 DELETE /api/v2/tailnet/{tailnet}/services/svc:<name>
 ```
 
-The CLI will need Tailscale API credentials with permission to manage Services and Service-host approvals, plus a way to run the host-side configuration on `m900`.
+The host needs Tailscale API credentials with permission to manage Services and Service-host approvals. The CLI needs no provider credentials.
 
 ### Calling the Tailscale API
 
@@ -182,7 +190,7 @@ curl \
   https://api.tailscale.com/api/v2/tailnet/-/services
 ```
 
-`ts-site` can make the same requests with its language's HTTPS client. The token is sent as HTTP Basic authentication with the token as the username and an empty password; bearer authentication is also supported by the API. The default tailnet identifier `-` is valid and resolves to the token's default tailnet.
+`ts-site` can make the same requests with its language's HTTPS client. The host's router makes these requests; the token is configured only on the host, never on CLI installations. The token is sent as HTTP Basic authentication with the token as the username and an empty password; bearer authentication is also supported by the API. The default tailnet identifier `-` is valid and resolves to the token's default tailnet.
 
 The relevant API operations and response envelopes are:
 
@@ -222,6 +230,7 @@ This would serve `/srv/sites/portfolio/current` directly from the daemon. The `t
 
 - Use Tailscale Services for stable per-site subdomains instead of plain `tailscale serve`, whose URL is tied to the host machine name.
 - Use the Tailscale API for Service definitions and approvals, and `tailscale serve --service` for endpoint configuration on `m900`.
+- Keep the CLI free of provider credentials: the host owns storage and edge routing, and the router interface (`src/routers/`) keeps Tailscale swappable for other providers such as Cloudflare.
 - Retain only four releases per site: the current release plus the previous three.
 - Use `m900` as the stable, always-on production host.
 
