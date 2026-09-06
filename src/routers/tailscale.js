@@ -143,8 +143,12 @@ async function provision(name) {
   } catch (error) {
     try {
       await removeEndpointIfConfigured(name);
-      if (service.created) await deleteService(name);
-    } catch { /* preserve the provisioning error; leave failed rollback state recoverable */ }
+    } catch { /* preserve the provisioning error */ }
+    if (service.created) {
+      try {
+        await deleteService(name);
+      } catch { /* preserve the provisioning error */ }
+    }
     throw error;
   }
   return { url: siteUrl(name) };

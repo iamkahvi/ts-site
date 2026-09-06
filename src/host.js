@@ -75,9 +75,9 @@ async function assertSiteExists(name) {
   }
 }
 
-async function readJson(req) {
+async function readJson(req, maxSize = MAX_BODY) {
   const length = Number(req.headers["content-length"]);
-  if (length > MAX_BODY) throw jsonError(413, "request is too large");
+  if (length > maxSize) throw jsonError(413, "request is too large");
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
@@ -237,7 +237,12 @@ async function serveSite(req, res, hostname, url) {
       res.end();
     } else {
       res.writeHead(200, { "content-type": contentType, "content-length": stat.size });
-      fs.createReadStream(actual).pipe(res);
+      const stream = fs.createReadStream(actual);
+      stream.on("error", (error) => {
+        if (!res.headersSent) send(res, 500, "could not read file\n");
+        else res.destroy(error);
+      });
+      stream.pipe(res);
     }
   } catch (error) {
     send(res, error.code === "ENOENT" ? 404 : 500, error.code === "ENOENT" ? "not found\n" : "could not read file\n");
