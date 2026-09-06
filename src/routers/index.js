@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * Edge router factory. TS_SITE_ROUTER selects the provider that owns routing a
  * site's hostname to the local origin. Routers implement:
@@ -14,4 +13,7 @@ if (!ROUTERS[selected]) {
   throw new Error(`unknown TS_SITE_ROUTER: ${selected} (expected one of: ${Object.keys(ROUTERS).join(", ")})`);
 }
 
-module.exports = require(ROUTERS[selected]);
+const router = require(ROUTERS[selected]);
+router.name = selected;
+
+module.exports = router;

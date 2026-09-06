@@ -1,59 +1,41 @@
-#!/usr/bin/env bun
 /**
  * Tailscale edge router. Owns everything Tailscale-specific: the control-plane
  * API (Service definitions, device discovery, host approval) and the local
  * data-plane wiring (`tailscale serve --service`). The origin only ever sees
  * plain HTTP on a local port and Host headers of the form <name>.<domain>.
  */
-const http = require("node:http");
-const https = require("node:https");
 const os = require("node:os");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
-const { assertSiteName, siteUrl } = require("../common");
+const { assertSiteName, siteUrl, jsonError, sleep, requestJson, DEFAULT_PORT } = require("../common");
 
 const execFileAsync = promisify(execFile);
 const API_KEY = process.env.TAILSCALE_API_KEY || "";
+const BASIC_AUTH = Buffer.from(`${API_KEY}:`).toString("base64");
 const TAILNET = process.env.TS_SITE_TAILNET || "-";
 const API_BASE = (process.env.TS_SITE_API_URL || "https://api.tailscale.com/api/v2/tailnet/") + encodeURIComponent(TAILNET);
 const HOSTNAME = process.env.TS_SITE_HOSTNAME || os.hostname();
 const HOST_TAG = process.env.TS_SITE_HOST_TAG || "tag:ts-site-host";
 const APPROVAL_TIMEOUT = Number(process.env.TS_SITE_APPROVAL_TIMEOUT || 60_000);
 const TAILSCALE_BIN = process.env.TS_SITE_TAILSCALE_BIN || "tailscale";
-const ENDPOINT_TARGET = process.env.TS_SITE_ENDPOINT_TARGET || `127.0.0.1:${process.env.TS_SITE_PORT || 8080}`;
+const ENDPOINT_TARGET = process.env.TS_SITE_ENDPOINT_TARGET || `127.0.0.1:${process.env.TS_SITE_PORT || DEFAULT_PORT}`;
 
 function serviceName(name) {
   return `svc:${assertSiteName(name)}`;
 }
 
 function apiRequest(requestPath, method, body) {
-  const url = new URL(requestPath, API_BASE.endsWith("/") ? API_BASE : `${API_BASE}/`);
-  const transport = url.protocol === "https:" ? https : http;
-  const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
-  return new Promise((resolve, reject) => {
-    const auth = Buffer.from(`${API_KEY}:`).toString("base64");
-    const req = transport.request(url, {
-      method,
-      headers: {
-        accept: "application/json", authorization: `Basic ${auth}`,
-        ...(payload ? { "content-type": "application/json", "content-length": payload.length } : {}),
-      },
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        const raw = Buffer.concat(chunks).toString("utf8");
-        let value = {};
-        try { value = raw ? JSON.parse(raw) : {}; } catch { value = { message: raw }; }
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          const error = new Error(value.message || value.error || `Tailscale API request failed (${res.statusCode})`);
-          error.upstreamStatus = res.statusCode;
-          reject(error);
-        } else resolve(value);
-      });
-    });
-    req.on("error", (error) => reject(new Error(`Tailscale API connection failed: ${error.message}`)));
-    if (payload) req.end(payload); else req.end();
+  return requestJson(API_BASE, requestPath, {
+    method,
+    body,
+    headers: {
+      authorization: `Basic ${BASIC_AUTH}`,
+    },
+    errorPrefix: "Tailscale API connection failed",
+    onError: (error, res, value) => {
+      error.message = value.message || value.error || `Tailscale API request failed (${res.statusCode})`;
+      error.upstreamStatus = res.statusCode;
+    },
   });
 }
 
@@ -70,33 +52,14 @@ async function listDevicesByHostname(hostname, fields) {
     : [];
 }
 
-function collisionError(message) {
-  const error = new Error(message);
-  error.status = 409;
-  return error;
-}
-
-function serviceRequestBody(service, addHttps = false) {
-  const body = { name: service.name };
-  const ports = Array.isArray(service.ports) ? service.ports : [];
-  body.ports = addHttps ? [...new Set([...ports, "tcp:443"])] : ports;
-  for (const field of ["displayName", "comment", "tags", "addrs"]) {
-    if (service[field] !== undefined) body[field] = service[field];
-  }
-  return body;
-}
-
-async function putService(service, addHttps = false) {
-  return apiRequest(`services/${encodeURIComponent(service.name)}`, "PUT", serviceRequestBody(service, addHttps));
-}
-
 async function createService(name) {
   const wanted = serviceName(name);
   const machines = await listDevicesByHostname(name);
-  if (machines.length > 0) throw collisionError(`Tailscale machine ${name} already exists`);
+  if (machines.length > 0) throw jsonError(409, `Tailscale machine ${name} already exists`);
   const existing = (await listServices()).find((item) => item.name === wanted);
-  if (existing) throw collisionError(`Tailscale Service ${wanted} already exists`);
-  return { service: await putService({ name: wanted, ports: [] }, true), created: true };
+  if (existing) throw jsonError(409, `Tailscale Service ${wanted} already exists`);
+  const service = await apiRequest(`services/${encodeURIComponent(wanted)}`, "PUT", { name: wanted, ports: ["tcp:443"] });
+  return { service, created: true };
 }
 
 async function deleteService(name) {
@@ -119,10 +82,6 @@ async function discoverHost() {
   }
   if (!device.nodeId) throw new Error(`Tailscale host ${HOSTNAME} did not return a nodeId`);
   return device;
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function waitForServiceHost(name, deviceId) {

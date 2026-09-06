@@ -1,4 +1,3 @@
-#!/usr/bin/env bun
 /**
  * No-op edge router for development and testing: storage works, no routing is
  * provisioned, and no external credentials are required.

@@ -13,15 +13,17 @@ const fsp = fs.promises;
 const path = require("node:path");
 const crypto = require("node:crypto");
 const router = require("./routers");
-const { assertSiteName, siteUrl, jsonError } = require("./common");
+const { assertSiteName, siteUrl, jsonError, sleep, DEFAULT_DOMAIN, DEFAULT_PORT } = require("./common");
 
 const ROOT = path.resolve(process.env.TS_SITE_ROOT || "/srv/sites");
-const PORT = Number(process.env.TS_SITE_PORT || 8080);
+const PORT = Number(process.env.TS_SITE_PORT || DEFAULT_PORT);
 const BIND = process.env.TS_SITE_BIND || "127.0.0.1";
-const DOMAIN = process.env.TS_SITE_DOMAIN || "tail37572.ts.net";
+const DOMAIN = process.env.TS_SITE_DOMAIN || DEFAULT_DOMAIN;
 const API_TOKEN = process.env.TS_SITE_API_TOKEN || "";
 const MAX_BODY = Number(process.env.TS_SITE_MAX_UPLOAD || 100 * 1024 * 1024);
 const DRAIN_TIMEOUT = Number(process.env.TS_SITE_DRAIN_TIMEOUT || 30_000);
+const RELEASES_DIR = "releases";
+const RELEASES_TO_KEEP = 5;
 const activeSiteRequests = new Map();
 
 function trackSiteRequest(name, res) {
@@ -44,7 +46,7 @@ async function waitForSiteIdle(name, timeout = DRAIN_TIMEOUT) {
   const deadline = Date.now() + timeout;
   while (activeSiteRequests.has(name)) {
     if (Date.now() >= deadline) throw new Error(`timed out waiting for active requests to ${name}`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await sleep(10);
   }
 }
 
@@ -64,7 +66,18 @@ function safeRelative(file) {
   return normalized;
 }
 
-async function readJson(req, maxSize = MAX_BODY) {
+async function assertSiteExists(name) {
+  try {
+    await fsp.access(path.join(siteDir(name), RELEASES_DIR));
+  } catch (error) {
+    if (error.code === "ENOENT") throw jsonError(404, "site not found");
+    throw error;
+  }
+}
+
+async function readJson(req) {
+  const length = Number(req.headers["content-length"]);
+  if (length > MAX_BODY) throw jsonError(413, "request is too large");
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
@@ -97,6 +110,12 @@ function requireApiAuth(req) {
   if (req.headers.authorization !== expected) throw jsonError(401, "missing or invalid API token");
 }
 
+function orchestrate(work) {
+  return work().catch((error) => {
+    throw error.status ? error : jsonError(502, error.message);
+  });
+}
+
 async function createSite(name) {
   const dir = siteDir(name);
   try {
@@ -108,8 +127,8 @@ async function createSite(name) {
     throw error;
   }
   try {
-    await fsp.mkdir(path.join(dir, "releases"), { recursive: false, mode: 0o755 });
-    await router.provision(name);
+    await fsp.mkdir(path.join(dir, RELEASES_DIR), { recursive: false, mode: 0o755 });
+    await orchestrate(() => router.provision(name));
   } catch (error) {
     await fsp.rm(dir, { recursive: true, force: true });
     throw error;
@@ -117,16 +136,10 @@ async function createSite(name) {
 }
 
 async function deleteSite(name) {
-  const releases = path.join(siteDir(name), "releases");
-  try {
-    await fsp.access(releases);
-  } catch (error) {
-    if (error.code === "ENOENT") throw jsonError(404, "site not found");
-    throw error;
-  }
+  await assertSiteExists(name);
   // Deprovision first so traffic stops before the content disappears. The
   // router drains, waits for active responses, then clears the endpoint.
-  await router.deprovision(name, () => waitForSiteIdle(name));
+  await orchestrate(() => router.deprovision(name, () => waitForSiteIdle(name)));
   await fsp.rm(siteDir(name), { recursive: true, force: true });
 }
 
@@ -137,17 +150,17 @@ function newReleaseId() {
 
 async function retainReleases(name) {
   const dir = siteDir(name);
-  const releasesDir = path.join(dir, "releases");
+  const releasesDir = path.join(dir, RELEASES_DIR);
   const currentLink = path.join(dir, "current");
   let current;
   try { current = await fsp.readlink(currentLink); } catch { current = ""; }
-  current = current.startsWith("releases/") ? current.slice("releases/".length) : "";
+  current = current.startsWith(`${RELEASES_DIR}/`) ? current.slice(`${RELEASES_DIR}/`.length) : "";
   const entries = (await fsp.readdir(releasesDir, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory())
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
     .map((entry) => entry.name)
     .sort()
     .reverse();
-  const keep = new Set([current, ...entries.slice(0, 4)]);
+  const keep = new Set([current, ...entries.slice(0, RELEASES_TO_KEEP - 1)]);
   for (const release of entries) {
     if (!keep.has(release)) await fsp.rm(path.join(releasesDir, release), { recursive: true, force: true });
   }
@@ -155,17 +168,12 @@ async function retainReleases(name) {
 
 async function deploy(name, files) {
   assertSiteName(name);
-  const dir = siteDir(name);
-  try {
-    await fsp.access(path.join(dir, "releases"));
-  } catch (error) {
-    if (error.code === "ENOENT") throw jsonError(404, "site not found");
-    throw error;
-  }
+  await assertSiteExists(name);
   if (!Array.isArray(files) || files.length === 0) throw jsonError(400, "deployment contains no files");
 
   const releaseId = newReleaseId();
-  const releasesDir = path.join(dir, "releases");
+  const dir = siteDir(name);
+  const releasesDir = path.join(dir, RELEASES_DIR);
   const temp = path.join(releasesDir, `.upload-${releaseId}`);
   const final = path.join(releasesDir, releaseId);
   await fsp.mkdir(temp, { recursive: true, mode: 0o755 });
@@ -186,7 +194,7 @@ async function deploy(name, files) {
     }
     await fsp.rename(temp, final);
     const next = path.join(dir, `.current-${releaseId}`);
-    await fsp.symlink(path.join("releases", releaseId), next);
+    await fsp.symlink(path.join(RELEASES_DIR, releaseId), next);
     await fsp.rename(next, path.join(dir, "current"));
     await retainReleases(name);
     return releaseId;
@@ -205,14 +213,14 @@ const CONTENT_TYPES = {
   ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon", ".txt": "text/plain; charset=utf-8",
 };
 
-async function serveSite(req, res, hostname) {
+async function serveSite(req, res, hostname, url) {
   const suffix = `.${DOMAIN}`;
   if (!hostname.endsWith(suffix)) return false;
   const name = hostname.slice(0, -suffix.length);
   try { assertSiteName(name); } catch { return false; }
   trackSiteRequest(name, res);
   let requestPath;
-  try { requestPath = decodeURIComponent(new URL(req.url, "http://localhost").pathname); } catch { send(res, 400, "bad URL"); return true; }
+  try { requestPath = decodeURIComponent(url.pathname); } catch { send(res, 400, "bad URL"); return true; }
   if (requestPath.includes("\0")) { send(res, 400, "bad URL"); return true; }
   const current = path.join(siteDir(name), "current");
   let base;
@@ -220,23 +228,21 @@ async function serveSite(req, res, hostname) {
   const file = path.resolve(base, `.${requestPath === "/" ? "/index.html" : requestPath}`);
   if (file !== base && !file.startsWith(`${base}${path.sep}`)) { send(res, 403, "forbidden\n"); return true; }
   try {
-    const stat = await fsp.stat(file);
+    let stat = await fsp.stat(file);
     const actual = stat.isDirectory() ? path.join(file, "index.html") : file;
-    const data = await fsp.readFile(actual);
-    if (req.method === "HEAD") { res.writeHead(200, { "content-type": CONTENT_TYPES[path.extname(actual).toLowerCase()] || "application/octet-stream", "content-length": data.length }); res.end(); }
-    else send(res, 200, data, { "content-type": CONTENT_TYPES[path.extname(actual).toLowerCase()] || "application/octet-stream" });
+    if (actual !== file) stat = await fsp.stat(actual);
+    const contentType = CONTENT_TYPES[path.extname(actual).toLowerCase()] || "application/octet-stream";
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "content-type": contentType, "content-length": stat.size });
+      res.end();
+    } else {
+      res.writeHead(200, { "content-type": contentType, "content-length": stat.size });
+      fs.createReadStream(actual).pipe(res);
+    }
   } catch (error) {
     send(res, error.code === "ENOENT" ? 404 : 500, error.code === "ENOENT" ? "not found\n" : "could not read file\n");
   }
   return true;
-}
-
-// Errors from the router carry no HTTP status of their own; surface their
-// message (e.g. Tailscale API failures) instead of a generic 500.
-function orchestrate(work) {
-  return work().catch((error) => {
-    throw error.status ? error : jsonError(502, error.message);
-  });
 }
 
 async function handle(req, res) {
@@ -244,7 +250,11 @@ async function handle(req, res) {
   if (url.pathname === "/healthz" && req.method === "GET") return send(res, 200, { ok: true, service: "ts-site-host" });
   const hostname = (req.headers.host || "").split(":")[0].toLowerCase();
   if (!url.pathname.startsWith("/api/")) {
-    if (req.method === "GET" || req.method === "HEAD") return serveSite(req, res, hostname);
+    if (req.method === "GET" || req.method === "HEAD") {
+      const served = await serveSite(req, res, hostname, url);
+      if (!served) send(res, 404, "not found\n");
+      return;
+    }
     return send(res, 405, "method not allowed\n");
   }
   requireApiAuth(req);
@@ -254,17 +264,17 @@ async function handle(req, res) {
   if (req.method === "POST" && !name) {
     const body = await readJson(req);
     assertSiteName(body.name);
-    await orchestrate(() => createSite(body.name));
-    return send(res, 201, { name: body.name, url: siteUrl(body.name) });
+    await createSite(body.name);
+    return send(res, 201, { name: body.name, url: siteUrl(body.name, DOMAIN) });
   }
   if (req.method === "POST" && name) {
     const body = await readJson(req);
     const release = await deploy(name, body.files);
-    return send(res, 201, { name, release, url: `https://${name}.${DOMAIN}` });
+    return send(res, 201, { name, release, url: siteUrl(name, DOMAIN) });
   }
   if (req.method === "DELETE" && name) {
     assertSiteName(name);
-    await orchestrate(() => deleteSite(name));
+    await deleteSite(name);
     return send(res, 200, { deleted: name });
   }
   return send(res, 405, { error: "method not allowed" });
@@ -274,8 +284,6 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((error) => {
     const status = error.status || 500;
     if (status >= 500) console.error(error.stack || error.message);
-    // Only unexpected internal errors are masked; 502 router failures carry
-    // their upstream message so clients see actionable output.
     if (!res.headersSent) send(res, status, { error: status === 500 ? "internal server error" : error.message });
     else res.destroy();
   });
@@ -298,8 +306,7 @@ function isHostAlreadyRunning() {
 }
 
 if (require.main === module) {
-  const selectedRouter = process.env.TS_SITE_ROUTER || "tailscale";
-  if (selectedRouter === "tailscale" && !API_TOKEN) {
+  if (router.name === "tailscale" && !API_TOKEN) {
     console.error("TS_SITE_API_TOKEN is required when TS_SITE_ROUTER=tailscale");
     process.exit(1);
   }

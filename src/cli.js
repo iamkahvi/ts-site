@@ -8,13 +8,11 @@ const fs = require("node:fs");
 const fsp = fs.promises;
 const path = require("node:path");
 const crypto = require("node:crypto");
-const http = require("node:http");
-const https = require("node:https");
 const readline = require("node:readline");
-const { assertSiteName } = require("./common");
+const { assertSiteName, requestJson: sendRequestJson, DEFAULT_PORT } = require("./common");
 
 const VERSION = require("../package.json").version;
-const HOST_URL = process.env.TS_SITE_HOST_URL || "http://127.0.0.1:8080";
+const HOST_URL = process.env.TS_SITE_HOST_URL || `http://127.0.0.1:${DEFAULT_PORT}`;
 
 const GENERAL_HELP = `Usage: ts-site <command> [options]
 
@@ -43,31 +41,13 @@ const COMMAND_HELP = {
 };
 
 function requestJson(base, requestPath, method, body) {
-  const url = new URL(requestPath, base.endsWith("/") ? base : `${base}/`);
-  const transport = url.protocol === "https:" ? https : http;
-  const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
-  return new Promise((resolve, reject) => {
-    const req = transport.request(url, {
-      method,
-      headers: {
-        accept: "application/json",
-        ...(payload ? { "content-type": "application/json", "content-length": payload.length } : {}),
-        ...(process.env.TS_SITE_API_TOKEN ? { authorization: `Bearer ${process.env.TS_SITE_API_TOKEN}` } : {}),
-      },
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        const raw = Buffer.concat(chunks).toString("utf8");
-        let value = {};
-        try { value = raw ? JSON.parse(raw) : {}; } catch { value = { message: raw }; }
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(value.error || value.message || `request failed (${res.statusCode})`));
-        } else resolve(value);
-      });
-    });
-    req.on("error", (error) => reject(new Error(`connection failed: ${error.message}`)));
-    if (payload) req.end(payload); else req.end();
+  return sendRequestJson(base, requestPath, {
+    method,
+    body,
+    headers: {
+      ...(process.env.TS_SITE_API_TOKEN ? { authorization: `Bearer ${process.env.TS_SITE_API_TOKEN}` } : {}),
+    },
+    errorPrefix: "connection failed",
   });
 }
 
