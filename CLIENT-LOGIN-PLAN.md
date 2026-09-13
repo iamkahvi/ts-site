@@ -100,7 +100,7 @@ Resolve the host URL in this order:
 
 - Add `src/client-config.js` for URL validation and configuration access.
 - Update `src/cli.js` with `login` and saved-host lookup.
-- Remove `TS_SITE_API_TOKEN` from client and host code, files, tests, and documentation.
+- Remove the legacy shared bearer credential from client and host code, files, tests, and documentation.
 - Add host tag authorization and `GET /api/whoami`.
 - Update CLI help and `README.md`.
 

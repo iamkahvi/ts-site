@@ -13,13 +13,13 @@ const fsp = fs.promises;
 const path = require("node:path");
 const crypto = require("node:crypto");
 const router = require("./routers");
+const { authorizeClient } = require("./host-auth");
 const { assertSiteName, siteUrl, jsonError, sleep, DEFAULT_DOMAIN, DEFAULT_PORT } = require("./common");
 
 const ROOT = path.resolve(process.env.TS_SITE_ROOT || "/srv/sites");
 const PORT = Number(process.env.TS_SITE_PORT || DEFAULT_PORT);
 const BIND = process.env.TS_SITE_BIND || "127.0.0.1";
 const DOMAIN = process.env.TS_SITE_DOMAIN || DEFAULT_DOMAIN;
-const API_TOKEN = process.env.TS_SITE_API_TOKEN || "";
 const MAX_BODY = Number(process.env.TS_SITE_MAX_UPLOAD || 100 * 1024 * 1024);
 const DRAIN_TIMEOUT = Number(process.env.TS_SITE_DRAIN_TIMEOUT || 30_000);
 const RELEASES_DIR = "releases";
@@ -102,12 +102,6 @@ function send(res, status, value, headers = {}) {
     ...headers,
   });
   res.end(body);
-}
-
-function requireApiAuth(req) {
-  if (!API_TOKEN) return;
-  const expected = `Bearer ${API_TOKEN}`;
-  if (req.headers.authorization !== expected) throw jsonError(401, "missing or invalid API token");
 }
 
 function orchestrate(work) {
@@ -262,7 +256,11 @@ async function handle(req, res) {
     }
     return send(res, 405, "method not allowed\n");
   }
-  requireApiAuth(req);
+  const identity = await authorizeClient(req);
+  if (url.pathname === "/api/whoami") {
+    if (req.method !== "GET") return send(res, 405, { error: "method not allowed" });
+    return send(res, 200, identity);
+  }
   const match = url.pathname.match(/^\/api\/sites(?:\/([a-z0-9-]+))?$/);
   if (!match) return send(res, 404, { error: "not found" });
   const name = match[1];
@@ -311,10 +309,6 @@ function isHostAlreadyRunning() {
 }
 
 if (require.main === module) {
-  if (router.name === "tailscale" && !API_TOKEN) {
-    console.error("TS_SITE_API_TOKEN is required when TS_SITE_ROUTER=tailscale");
-    process.exit(1);
-  }
   fsp.mkdir(ROOT, { recursive: true }).then(() => {
     server.once("error", async (error) => {
       if (error.code === "EADDRINUSE" && await isHostAlreadyRunning()) {
@@ -329,6 +323,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  server, safeRelative, retainReleases, deploy, createSite, deleteSite,
+  server, handle, safeRelative, retainReleases, deploy, createSite, deleteSite,
   trackSiteRequest, waitForSiteIdle,
 };

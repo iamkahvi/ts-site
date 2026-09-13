@@ -9,11 +9,14 @@
   tailscale status
   ```
 
-- **Verify the existing Tailscale host**
+- **Verify the existing Tailscale host and client policy**
   ```sh
   tailscale status --json
   ```
-  Confirm the machine is online as `m900` and has `tag:ts-site-host`.
+  Confirm the machine is online as `m900` and has `tag:ts-site-host`. In the
+  tailnet policy, make `tag:ts-site-client` admin-owned and grant that tag
+  access to `tag:ts-site-host` on TCP port 8091. Assign the client tag to every
+  device allowed to manage sites.
 
 - **Upgrade Bun to the required version**
   ```sh
@@ -69,11 +72,14 @@
   sudo systemctl enable --now ts-site.service
   ```
 
-- **Grant Tailscale Serve control to the daemon user**
+- **Grant Tailscale CLI access to the daemon user**
   ```sh
   sudo tailscale set --operator=ts-site
+  sudo -u ts-site tailscale whois --json <tagged-client-tailscale-ip>
   ```
-  This allows the `ts-site` systemd process to run `tailscale serve` without root.
+  This allows the `ts-site` process to run `tailscale serve` and resolve API
+  callers with `tailscale whois`. Confirm the returned node contains
+  `tag:ts-site-client` before starting the service.
 
 - **Verify the running production daemon**
   ```sh
@@ -84,4 +90,7 @@
   ```
   The service should be enabled, active, running as `ts-site`, and return `{"ok":true}`.
 
-Firewall restrictions and site provisioning were intentionally deferred. Port 8091 currently listens on all interfaces until a firewall policy is applied.
+The host authorizes every `/api/*` request from the direct Tailscale peer
+identity and rejects callers without `tag:ts-site-client`, including LAN and
+localhost callers. Restricting port 8091 to the Tailscale interface remains
+recommended defense in depth.

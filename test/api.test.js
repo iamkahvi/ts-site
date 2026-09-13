@@ -60,6 +60,10 @@ function freePort() {
 async function startHost(env = {}) {
   const port = await freePort();
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-host-"));
+  const whoisBin = await writeFakeBinary(root, "tailscale-whois", `#!/bin/sh
+if [ "$1" != "whois" ] || [ "$2" != "--json" ]; then exit 1; fi
+printf '%s\\n' '{"Node":{"ComputedName":"test-client","Tags":["tag:ts-site-client"]}}'
+`);
   const child = spawn(process.execPath, ["src/host.js"], {
     cwd: REPO,
     env: {
@@ -68,7 +72,7 @@ async function startHost(env = {}) {
       TS_SITE_BIND: "127.0.0.1",
       TS_SITE_PORT: String(port),
       TS_SITE_DOMAIN: "example.ts.net",
-      TS_SITE_API_TOKEN: "host-token",
+      TS_SITE_WHOIS_BIN: whoisBin,
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -94,18 +98,19 @@ async function startHost(env = {}) {
   };
 }
 
-async function runCli(args, env) {
-  return execFileAsync(process.execPath, ["src/cli.js", ...args], { cwd: REPO, env });
+async function runCli(args, env, cwd = REPO) {
+  return execFileAsync(process.execPath, [path.join(REPO, "src/cli.js"), ...args], { cwd, env });
 }
 
-function cliEnv(hostUrl, token) {
+function cliEnv(hostUrl, configHome) {
   const env = { ...process.env };
   for (const key of [
     "TAILSCALE_API_KEY", "TS_SITE_API_URL", "TS_SITE_TAILNET", "TS_SITE_ROUTER", "TS_SITE_HOSTNAME",
-    "TS_SITE_HOST_TAG", "TS_SITE_APPROVAL_TIMEOUT", "TS_SITE_SKIP_TAILSCALE", "TS_SITE_API_TOKEN", "TS_SITE_HOST_URL",
+    "TS_SITE_HOST_TAG", "TS_SITE_APPROVAL_TIMEOUT", "TS_SITE_SKIP_TAILSCALE", "TS_SITE_HOST_URL",
+    "XDG_CONFIG_HOME",
   ]) delete env[key];
-  env.TS_SITE_HOST_URL = hostUrl;
-  if (token) env.TS_SITE_API_TOKEN = token;
+  if (hostUrl) env.TS_SITE_HOST_URL = hostUrl;
+  if (configHome) env.XDG_CONFIG_HOME = configHome;
   return env;
 }
 
@@ -163,7 +168,7 @@ test("init provisions storage and the Tailscale Service end to end", async () =>
   try {
     const response = await fetch(`${host.url}/api/sites`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
     assert.equal(response.status, 201);
@@ -184,7 +189,7 @@ test("init provisions storage and the Tailscale Service end to end", async () =>
     // Duplicate init fails on storage creation before touching the router.
     const duplicate = await fetch(`${host.url}/api/sites`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
     assert.equal(duplicate.status, 409);
@@ -223,7 +228,7 @@ test("init rejects an existing Service without changing it", async () => {
   try {
     const response = await fetch(`${host.url}/api/sites`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
     assert.equal(response.status, 409);
@@ -266,7 +271,7 @@ test("init rejects a machine-name collision before checking Services", async () 
   try {
     const response = await fetch(`${host.url}/api/sites`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
     assert.equal(response.status, 409);
@@ -310,7 +315,7 @@ test("failed init clears the local endpoint before deleting the new Service", as
   try {
     const response = await fetch(`${host.url}/api/sites`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
     assert.equal(response.status, 502);
@@ -354,7 +359,6 @@ test("delete drains the endpoint, removes storage, and tolerates an absent Servi
     await fsp.mkdir(path.join(host.root, "portfolio", "releases"), { recursive: true });
     const response = await fetch(`${host.url}/api/sites/portfolio`, {
       method: "DELETE",
-      headers: { authorization: "Bearer host-token" },
     });
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { deleted: "portfolio" });
@@ -388,7 +392,6 @@ test("delete keeps storage and fails loudly when the router cannot drain", async
     await fsp.mkdir(path.join(host.root, "portfolio", "releases"), { recursive: true });
     const response = await fetch(`${host.url}/api/sites/portfolio`, {
       method: "DELETE",
-      headers: { authorization: "Bearer host-token" },
     });
     assert.equal(response.status, 502);
     assert.match((await response.json()).error, /drain exploded/);
@@ -416,7 +419,7 @@ test("delete refuses to deprovision a site not owned by this host", async () => 
 
   try {
     const response = await fetch(`${host.url}/api/sites/portfolio`, {
-      method: "DELETE", headers: { authorization: "Bearer host-token" },
+      method: "DELETE",
     });
     assert.equal(response.status, 404);
     assert.deepEqual(await response.json(), { error: "site not found" });
@@ -447,7 +450,7 @@ test("delete skips an absent local endpoint and remains retry-safe", async () =>
   try {
     await fsp.mkdir(path.join(host.root, "portfolio", "releases"), { recursive: true });
     const response = await fetch(`${host.url}/api/sites/portfolio`, {
-      method: "DELETE", headers: { authorization: "Bearer host-token" },
+      method: "DELETE",
     });
     assert.equal(response.status, 200);
     assert.equal((await fsp.readFile(log, "utf8")).trim(), "serve get-config --all");
@@ -511,39 +514,46 @@ test("origin idle tracking waits for active responses", async () => {
   assert.equal(resolved, true);
 });
 
-test("Tailscale mode refuses to start without host API authentication", async () => {
-  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-host-"));
-  const child = spawn(process.execPath, ["src/host.js"], {
-    cwd: REPO,
-    env: {
-      ...process.env,
-      TS_SITE_ROOT: root,
-      TS_SITE_BIND: "127.0.0.1",
-      TS_SITE_PORT: "0",
-      TS_SITE_ROUTER: "tailscale",
-      TS_SITE_API_TOKEN: "",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stderr = "";
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-
-  let timer;
+test("whoami returns the authorized client identity", async () => {
+  const host = await startHost({ TS_SITE_ROUTER: "none" });
   try {
-    const code = await Promise.race([
-      new Promise((resolve) => child.once("exit", resolve)),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("host remained running without TS_SITE_API_TOKEN")), 2_000); }),
-    ]);
-    assert.notEqual(code, 0);
-    assert.match(stderr, /TS_SITE_API_TOKEN is required/);
+    const response = await fetch(`${host.url}/api/whoami`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { name: "test-client", tags: ["tag:ts-site-client"] });
+
+    const wrongMethod = await fetch(`${host.url}/api/whoami`, { method: "POST" });
+    assert.equal(wrongMethod.status, 405);
+    assert.deepEqual(await wrongMethod.json(), { error: "method not allowed" });
   } finally {
-    clearTimeout(timer);
-    if (child.exitCode === null) child.kill("SIGTERM");
-    await fsp.rm(root, { recursive: true, force: true });
+    await host.stop();
+    await fsp.rm(host.root, { recursive: true, force: true });
   }
 });
 
-test("router=none supports the full storage lifecycle without Tailscale", async () => {
+test("whoami and site APIs reject clients without the required tag", async () => {
+  const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
+  const untaggedWhois = await writeFakeBinary(binRoot, "tailscale-whois", `#!/bin/sh
+printf '%s\\n' '{"Node":{"ComputedName":"untagged-client","Tags":["tag:other"]}}'
+`);
+  const host = await startHost({ TS_SITE_ROUTER: "none", TS_SITE_WHOIS_BIN: untaggedWhois });
+  try {
+    for (const [requestPath, options] of [
+      ["/api/whoami", {}],
+      ["/api/sites", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "portfolio" }) }],
+      ["/api/sites/portfolio", { method: "DELETE" }],
+    ]) {
+      const response = await fetch(`${host.url}${requestPath}`, options);
+      assert.equal(response.status, 403);
+      assert.deepEqual(await response.json(), { error: "client device is not authorized" });
+    }
+  } finally {
+    await host.stop();
+    await fsp.rm(binRoot, { recursive: true, force: true });
+    await fsp.rm(host.root, { recursive: true, force: true });
+  }
+});
+
+test("router=none supports the full storage lifecycle without edge routing", async () => {
   const binRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-bin-"));
   const fakeTailscale = await writeFakeBinary(binRoot, "tailscale", "#!/bin/sh\necho \"tailscale must not be invoked\" >&2\nexit 1\n");
 
@@ -559,7 +569,7 @@ test("router=none supports the full storage lifecycle without Tailscale", async 
   try {
     const init = await fetch(`${host.url}/api/sites`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "portfolio" }),
     });
     assert.equal(init.status, 201);
@@ -567,7 +577,7 @@ test("router=none supports the full storage lifecycle without Tailscale", async 
 
     const deploy = await fetch(`${host.url}/api/sites/portfolio`, {
       method: "POST",
-      headers: { authorization: "Bearer host-token", "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ files }),
     });
     assert.equal(deploy.status, 201);
@@ -582,7 +592,6 @@ test("router=none supports the full storage lifecycle without Tailscale", async 
 
     const removed = await fetch(`${host.url}/api/sites/portfolio`, {
       method: "DELETE",
-      headers: { authorization: "Bearer host-token" },
     });
     assert.equal(removed.status, 200);
     await assert.rejects(fsp.stat(path.join(host.root, "portfolio")), (error) => error.code === "ENOENT");
@@ -593,13 +602,12 @@ test("router=none supports the full storage lifecycle without Tailscale", async 
   }
 });
 
-test("CLI is a pure client: no provider credentials, no routing knowledge", async () => {
+test("CLI login saves the host and later commands use it without credentials", async () => {
   const calls = [];
-  const TOKEN = "host-token";
   const host = await listen(async (req, res) => {
     const body = await readBody(req);
     calls.push({ method: req.method, path: req.url, body, contentLength: req.headers["content-length"], authorization: req.headers.authorization });
-    if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(res, 401, { error: "missing or invalid API token" });
+    if (req.method === "GET" && req.url === "/api/whoami") return send(res, 200, { name: "test-client", tags: ["tag:ts-site-client"] });
     if (req.method === "POST" && req.url === "/api/sites") return send(res, 201, { name: body.name, url: `https://${body.name}.example.ts.net` });
     if (req.method === "POST" && req.url === "/api/sites/portfolio") return send(res, 201, { name: "portfolio", release: "r1", url: "https://portfolio.example.ts.net" });
     if (req.method === "DELETE" && req.url === "/api/sites/portfolio") return send(res, 200, { deleted: "portfolio" });
@@ -607,11 +615,20 @@ test("CLI is a pure client: no provider credentials, no routing knowledge", asyn
   });
 
   const siteRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-site-"));
+  const configHome = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-client-"));
   await fsp.writeFile(path.join(siteRoot, "index.html"), "hello");
 
   try {
-    const env = cliEnv(host.url, TOKEN);
-    const init = await runCli(["init", "portfolio"], env);
+    const env = cliEnv(null, configHome);
+    const loggedIn = await runCli(["login", `${host.url}/ignored?query=yes`], env, siteRoot);
+    assert.match(loggedIn.stdout, new RegExp(`Configured host: ${host.url.replaceAll(".", "\\.")}`));
+    assert.match(loggedIn.stdout, /Device: test-client/);
+    assert.deepEqual(
+      JSON.parse(await fsp.readFile(path.join(configHome, "ts-site", "config.json"), "utf8")),
+      { hostUrl: host.url },
+    );
+
+    const init = await runCli(["init", "portfolio"], env, siteRoot);
     assert.match(init.stdout, /Created portfolio/);
     assert.match(init.stdout, /https:\/\/portfolio\.example\.ts\.net/);
     assert.deepEqual(calls.at(-1), {
@@ -619,44 +636,94 @@ test("CLI is a pure client: no provider credentials, no routing knowledge", asyn
       path: "/api/sites",
       body: { name: "portfolio" },
       contentLength: String(Buffer.byteLength(JSON.stringify({ name: "portfolio" }))),
-      authorization: "Bearer host-token",
+      authorization: undefined,
     });
 
-    const deploy = await runCli(["deploy", "portfolio", siteRoot], env);
+    const deploy = await runCli(["deploy", "portfolio", siteRoot], env, siteRoot);
     assert.match(deploy.stdout, /Deployed portfolio/);
     assert.match(deploy.stdout, /Release: r1/);
-    assert.match(deploy.stdout, /URL: https:\/\/portfolio\.example\.ts\.net/);
     const deployCall = calls.at(-1);
-    assert.equal(deployCall.method, "POST");
     assert.equal(deployCall.path, "/api/sites/portfolio");
     assert.deepEqual(deployCall.body.files, [{ path: "index.html", size: 5, sha256: crypto.createHash("sha256").update("hello").digest("hex"), content: Buffer.from("hello").toString("base64") }]);
 
-    const removed = await runCli(["delete", "portfolio", "--yes"], env);
+    const removed = await runCli(["delete", "portfolio", "--yes"], env, siteRoot);
     assert.match(removed.stdout, /Deleted portfolio/);
-    const deleteCall = calls.at(-1);
-    assert.equal(deleteCall.method, "DELETE");
-    assert.equal(deleteCall.path, "/api/sites/portfolio");
-    assert.deepEqual(deleteCall.body, {});
-
-    // Wrong credentials fail with the host's message.
-    await assert.rejects(
-      runCli(["init", "portfolio"], cliEnv(host.url, "wrong-token")),
-      (error) => error.stderr.includes("missing or invalid API token"),
-    );
-
-    // v1 no-auth mode: the host accepts unauthenticated clients when it has no token configured.
-    const openHost = await listen(async (req, res) => {
-      if (req.method === "POST" && req.url === "/api/sites") return send(res, 201, { name: "portfolio", url: "https://portfolio.example.ts.net" });
-      return send(res, 404, { error: "unexpected route" });
-    });
-    try {
-      const open = await runCli(["init", "portfolio"], cliEnv(openHost.url, ""));
-      assert.match(open.stdout, /Created portfolio/);
-    } finally {
-      await close(openHost.server);
-    }
+    assert.equal(calls.at(-1).path, "/api/sites/portfolio");
+    assert.equal(calls.every((call) => call.authorization === undefined), true);
   } finally {
     await close(host.server);
     await fsp.rm(siteRoot, { recursive: true, force: true });
+    await fsp.rm(configHome, { recursive: true, force: true });
+  }
+});
+
+test("CLI login rejection does not replace saved configuration", async () => {
+  const host = await listen(async (_req, res) => send(res, 403, { error: "client device is not authorized" }));
+  const configHome = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-client-"));
+  const file = path.join(configHome, "ts-site", "config.json");
+  try {
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, JSON.stringify({ hostUrl: "http://existing-host:8091" }));
+    await assert.rejects(
+      runCli(["login", host.url], cliEnv(null, configHome)),
+      (error) => error.stderr.includes("client device is not authorized"),
+    );
+    assert.deepEqual(JSON.parse(await fsp.readFile(file, "utf8")), { hostUrl: "http://existing-host:8091" });
+  } finally {
+    await close(host.server);
+    await fsp.rm(configHome, { recursive: true, force: true });
+  }
+});
+
+test("CLI login connection failure does not write configuration", async () => {
+  const port = await freePort();
+  const configHome = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-client-"));
+  try {
+    await assert.rejects(
+      runCli(["login", `http://127.0.0.1:${port}`], cliEnv(null, configHome)),
+      (error) => error.stderr.includes("connection failed"),
+    );
+    await assert.rejects(
+      fsp.stat(path.join(configHome, "ts-site", "config.json")),
+      (error) => error.code === "ENOENT",
+    );
+  } finally {
+    await fsp.rm(configHome, { recursive: true, force: true });
+  }
+});
+
+test("CLI environment host overrides saved configuration", async () => {
+  let savedCalls = 0;
+  let overrideCalls = 0;
+  const savedHost = await listen(async (_req, res) => { savedCalls += 1; send(res, 500, { error: "saved host used" }); });
+  const overrideHost = await listen(async (req, res) => {
+    overrideCalls += 1;
+    if (req.method === "POST" && req.url === "/api/sites") return send(res, 201, { name: "portfolio", url: "https://portfolio.example.ts.net" });
+    send(res, 404, { error: "unexpected route" });
+  });
+  const configHome = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-client-"));
+  const file = path.join(configHome, "ts-site", "config.json");
+  try {
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, JSON.stringify({ hostUrl: savedHost.url }));
+    const result = await runCli(["init", "portfolio"], cliEnv(`${overrideHost.url}/path`, configHome));
+    assert.match(result.stdout, /Created portfolio/);
+    assert.equal(savedCalls, 0);
+    assert.equal(overrideCalls, 1);
+  } finally {
+    await Promise.all([close(savedHost.server), close(overrideHost.server)]);
+    await fsp.rm(configHome, { recursive: true, force: true });
+  }
+});
+
+test("CLI reports when no host is configured", async () => {
+  const configHome = await fsp.mkdtemp(path.join(os.tmpdir(), "ts-site-client-"));
+  try {
+    await assert.rejects(
+      runCli(["init", "portfolio"], cliEnv(null, configHome)),
+      (error) => error.stderr.includes("no host configured; run ts-site login <host-url>"),
+    );
+  } finally {
+    await fsp.rm(configHome, { recursive: true, force: true });
   }
 });

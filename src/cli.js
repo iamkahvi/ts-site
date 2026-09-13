@@ -9,16 +9,17 @@ const fsp = fs.promises;
 const path = require("node:path");
 const crypto = require("node:crypto");
 const readline = require("node:readline");
-const { assertSiteName, requestJson: sendRequestJson, DEFAULT_PORT } = require("./common");
+const { assertSiteName, requestJson: sendRequestJson } = require("./common");
+const { normalizeHostUrl, resolveHostUrl, saveHostUrl } = require("./client-config");
 
 const VERSION = require("../package.json").version;
-const HOST_URL = process.env.TS_SITE_HOST_URL || `http://127.0.0.1:${DEFAULT_PORT}`;
 
 const GENERAL_HELP = `Usage: ts-site <command> [options]
 
 Deploy and manage private static sites.
 
 Commands:
+  login <host-url>           Verify and save the ts-site host
   init <name>                Create and configure a new site
   deploy <name> <directory>  Upload and activate a site build
   delete <name>              Delete a site and its stored releases
@@ -30,11 +31,13 @@ Options:
   --yes                      Confirm a destructive operation
 
 Examples:
+  ts-site login http://m900:8091
   ts-site init portfolio
   ts-site deploy portfolio ./dist
   ts-site delete portfolio`;
 
 const COMMAND_HELP = {
+  login: "Usage: ts-site login <host-url>\n\nVerify this device with the host and save the host URL.",
   init: "Usage: ts-site init <name>\n\nCreate a site and print its private HTTPS URL.",
   deploy: "Usage: ts-site deploy <name> <directory>\n\nUpload a static directory and atomically activate it.",
   delete: "Usage: ts-site delete <name> [--yes]\n\nDelete a site. Interactive confirmation is required unless --yes is supplied.",
@@ -44,15 +47,23 @@ function requestJson(base, requestPath, method, body) {
   return sendRequestJson(base, requestPath, {
     method,
     body,
-    headers: {
-      ...(process.env.TS_SITE_API_TOKEN ? { authorization: `Bearer ${process.env.TS_SITE_API_TOKEN}` } : {}),
-    },
     errorPrefix: "connection failed",
   });
 }
 
-function hostRequest(requestPath, method, body) {
-  return requestJson(HOST_URL, requestPath, method, body);
+async function hostRequest(requestPath, method, body) {
+  return requestJson(await resolveHostUrl(), requestPath, method, body);
+}
+
+async function login(hostUrl) {
+  const normalized = normalizeHostUrl(hostUrl);
+  const identity = await requestJson(normalized, "api/whoami", "GET");
+  if (!identity || typeof identity.name !== "string" || !identity.name.trim() || !Array.isArray(identity.tags)) {
+    throw new Error("host returned an invalid client identity");
+  }
+  await saveHostUrl(normalized);
+  console.log(`Configured host: ${normalized}`);
+  console.log(`Device: ${identity.name}`);
 }
 
 async function walkDirectory(directory, relative = "") {
@@ -127,6 +138,7 @@ async function main(argv = process.argv.slice(2)) {
   if (positional[0] === "--version" || positional[0] === "-V") { console.log(VERSION); return; }
   const [command, ...args] = positional;
   if (args.includes("--help") || args.includes("-h")) { console.log(COMMAND_HELP[command] || GENERAL_HELP); return; }
+  if (command === "login" && args.length === 1) return login(args[0]);
   if (command === "init" && args.length === 1) return init(args[0]);
   if (command === "deploy" && args.length === 2) return deploy(args[0], args[1]);
   if (command === "delete" && args.length === 1) return remove(args[0], flags.yes);
