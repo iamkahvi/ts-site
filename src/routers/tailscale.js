@@ -5,11 +5,8 @@
  * plain HTTP on a local port and Host headers of the form <name>.<domain>.
  */
 const os = require("node:os");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
 const { assertSiteName, siteUrl, jsonError, sleep, requestJson, DEFAULT_PORT } = require("../common");
-
-const execFileAsync = promisify(execFile);
+const { runTailscale } = require("../tailscale-command");
 const API_KEY = process.env.TAILSCALE_API_KEY || "";
 const BASIC_AUTH = Buffer.from(`${API_KEY}:`).toString("base64");
 const TAILNET = process.env.TS_SITE_TAILNET || "-";
@@ -17,7 +14,6 @@ const API_BASE = (process.env.TS_SITE_API_URL || "https://api.tailscale.com/api/
 const HOSTNAME = process.env.TS_SITE_HOSTNAME || os.hostname();
 const HOST_TAG = process.env.TS_SITE_HOST_TAG || "tag:ts-site-host";
 const APPROVAL_TIMEOUT = Number(process.env.TS_SITE_APPROVAL_TIMEOUT || 60_000);
-const TAILSCALE_BIN = process.env.TS_SITE_TAILSCALE_BIN || "tailscale";
 const ENDPOINT_TARGET = process.env.TS_SITE_ENDPOINT_TARGET || `127.0.0.1:${process.env.TS_SITE_PORT || DEFAULT_PORT}`;
 
 function serviceName(name) {
@@ -103,12 +99,12 @@ async function waitForServiceHost(name, deviceId) {
   throw new Error(`timed out waiting for ${HOSTNAME} to host ${wanted}`);
 }
 
-function runTailscale(args) {
-  return execFileAsync(TAILSCALE_BIN, args, { timeout: 30_000, maxBuffer: 1024 * 1024 });
+function runTailscaleCommand(args) {
+  return runTailscale(args, { timeout: 30_000 });
 }
 
 async function getServeConfig() {
-  const { stdout } = await runTailscale(["serve", "get-config", "--all"]);
+  const { stdout } = await runTailscaleCommand(["serve", "get-config", "--all"]);
   try {
     const config = JSON.parse(stdout);
     if (!config || typeof config !== "object") throw new Error("configuration is not an object");
@@ -122,14 +118,14 @@ async function removeEndpointIfConfigured(name, waitForIdle = async () => {}) {
   const service = serviceName(name);
   const config = await getServeConfig();
   if (!config.services || !Object.prototype.hasOwnProperty.call(config.services, service)) return false;
-  await runTailscale(["serve", "drain", service]);
+  await runTailscaleCommand(["serve", "drain", service]);
   await waitForIdle();
-  await runTailscale(["serve", "clear", service]);
+  await runTailscaleCommand(["serve", "clear", service]);
   return true;
 }
 
 async function configureEndpoint(name) {
-  await runTailscale(["serve", `--service=${serviceName(name)}`, "--https=443", ENDPOINT_TARGET]);
+  await runTailscaleCommand(["serve", `--service=${serviceName(name)}`, "--https=443", ENDPOINT_TARGET]);
 }
 
 async function provision(name) {

@@ -1,29 +1,53 @@
 # ts-site
 
-Deploy private static sites to a tagged host. The host daemon owns site
-storage and edge routing; the routing provider is swappable (Tailscale by
-default, Cloudflare etc. later) and holds the only provider credentials.
-The CLI is a thin client for the host API.
+Deploy private static sites to a tagged host. The host daemon owns site storage
+and edge routing; the CLI is a credential-free client for the host API.
 
 ## Architecture
 
 ```text
-CLI  --HTTP-->  host daemon  --provision/deprovision-->  edge router
-                (storage,             (tailscale.js today;
-                 releases,             cloudflare.js etc. later)
-                 origin serving)
+CLI  --HTTP over Tailscale-->  host daemon  --provision/deprovision-->  edge router
+                               (storage,             (tailscale.js today;
+                                releases,             cloudflare.js later)
+                                origin serving)
 ```
 
-- The origin is plain HTTP on a local port and routes by Host header, so any
-  provider that can route a hostname to `127.0.0.1:<port>` works.
 - The host selects its router with `TS_SITE_ROUTER` (`tailscale` or `none`).
-- The CLI needs only the host URL and the host API token; it never touches
-  provider APIs or holds provider credentials.
+- The CLI stores only the host URL and never holds provider credentials.
+- Every `/api/*` request is authorized from its Tailscale source identity.
+- The caller device must have the exact tag `tag:ts-site-client`.
+- `router=none` disables edge provisioning, not API authorization.
+
+## Tailnet policy
+
+A tailnet administrator must own and assign the client tag. Tailnet grants must
+also let tagged clients reach the host API port. Adapt this example to the
+existing tailnet policy and selected port:
+
+```json
+{
+  "tagOwners": {
+    "tag:ts-site-client": ["autogroup:admin"],
+    "tag:ts-site-host": ["autogroup:admin"]
+  },
+  "grants": [
+    {
+      "src": ["tag:ts-site-client"],
+      "dst": ["tag:ts-site-host"],
+      "ip": ["tcp:8091"]
+    }
+  ]
+}
+```
+
+Assign `tag:ts-site-client` to each device allowed to manage sites. Tagging does
+not itself grant network reachability, so both `tagOwners` and a grant/ACL are
+required.
 
 ## Host setup
 
-The host needs Bun 1.3+, Tailscale, and the tag configured by
-`TS_SITE_HOST_TAG` (default: `tag:ts-site-host`). Bun loads `.env` automatically.
+The host needs Bun 1.3+, Tailscale, and `tag:ts-site-host`. Bun loads `.env`
+automatically.
 
 ```sh
 sudo install -d -o ts-site -g ts-site /srv/sites
@@ -31,23 +55,26 @@ cp .env.host.example .env
 $EDITOR .env
 ```
 
-Set at least these host values:
+Set at least:
 
 ```dotenv
 TS_SITE_ROUTER=tailscale
 TAILSCALE_API_KEY=tskey-api-...
 TS_SITE_ROOT=/srv/sites
 TS_SITE_BIND=0.0.0.0
-TS_SITE_PORT=8080
-TS_SITE_API_TOKEN=a-long-random-secret
+TS_SITE_PORT=8091
 ```
 
-`0.0.0.0` lets the CLI reach the API through the host's Tailscale address and
-lets the local Service proxy use `127.0.0.1:8080`. Restrict port 8080 to trusted
-networks and always configure a strong API token. The Tailscale API key lives
-only here; CLI installations never see it.
+`TAILSCALE_API_KEY` is a host-only provider credential used to provision
+Tailscale Services. It is never sent to or stored by CLI installations.
 
-For local development without Tailscale, set `TS_SITE_ROUTER=none`.
+The service user must be able to run both `tailscale serve` and `tailscale
+whois`. For example:
+
+```sh
+sudo tailscale set --operator=ts-site
+sudo -u ts-site tailscale whois --json <tagged-client-tailscale-ip>
+```
 
 Start the host from the directory containing `.env`:
 
@@ -55,30 +82,39 @@ Start the host from the directory containing `.env`:
 bun run host
 ```
 
-Run it under systemd for a permanent installation. The service user must be
-able to write `TS_SITE_ROOT` and run the required `tailscale serve` commands.
+Run it under systemd for a permanent installation. The daemon may listen on all
+interfaces, but non-Tailscale, LAN, and localhost API callers fail identity
+resolution and are rejected. Firewall restrictions to the Tailscale interface
+are still recommended as defense in depth.
+
+For storage development without edge provisioning, set
+`TS_SITE_ROUTER=none`. API callers still require Tailscale identity and the
+client tag.
 
 ## CLI setup
 
-Install the command and create its configuration:
+Install the command, have an administrator tag the client device, then log in
+through the host's Tailscale address or MagicDNS name:
 
 ```sh
 bun link
-cp .env.client.example .env
-$EDITOR .env
+ts-site login http://m900:8091
 ```
 
-Set at least:
+Login calls `GET /api/whoami` and saves only the normalized host origin in:
 
-```dotenv
-TS_SITE_HOST_URL=http://m900:8080
-TS_SITE_API_TOKEN=a-long-random-secret
+```text
+$XDG_CONFIG_HOME/ts-site/config.json
 ```
 
-No Tailscale credentials are required; `TS_SITE_API_TOKEN` must match the
-host's value. Authentication may be omitted only with `TS_SITE_ROUTER=none`.
+When `XDG_CONFIG_HOME` is unset, the file is
+`~/.config/ts-site/config.json`. The directory is mode `0700` and the file is
+written atomically with mode `0600`.
 
-Then initialize, deploy, and delete sites:
+The optional `TS_SITE_HOST_URL` environment variable overrides the saved host
+for CI or one-time use. It is not a credential.
+
+Then initialize, deploy, and delete sites from any directory:
 
 ```sh
 ts-site init portfolio

@@ -5,6 +5,9 @@ A small CLI for deploying private static websites to the always-on `m900` Linux 
 ## Goal: MVP flow
 
 ```bash
+# Verify this tagged device and save the host URL.
+ts-site login http://m900:8091
+
 # Create a site and get its private HTTPS URL.
 ts-site init portfolio
 
@@ -31,6 +34,7 @@ Usage: ts-site <command> [options]
 Deploy and manage private static sites on Tailscale.
 
 Commands:
+  login <host-url>           Verify and save the ts-site host
   init <name>                Create and configure a new site
   deploy <name> <directory>  Upload and activate a site build
   delete <name>              Delete a site and its stored releases
@@ -41,12 +45,23 @@ Options:
   -V, --version              Show the CLI version
 
 Examples:
+  ts-site login http://m900:8091
   ts-site init portfolio
   ts-site deploy portfolio ./dist
   ts-site delete portfolio
 ```
 
 ## Command behavior
+
+### `ts-site login <host-url>`
+
+- Accept an HTTP or HTTPS URL and normalize it to its origin.
+- Request `GET /api/whoami` through Tailscale.
+- Save only the normalized URL after the host confirms that the caller has
+  `tag:ts-site-client`.
+- Store configuration in `$XDG_CONFIG_HOME/ts-site/config.json`, falling back
+  to `~/.config/ts-site/config.json`.
+- Resolve later commands from `TS_SITE_HOST_URL`, then saved configuration.
 
 ### `ts-site init <name>`
 
@@ -100,9 +115,20 @@ The `current` symlink is changed only after a release has been fully uploaded an
 
 ## Access control
 
-Sites are intended to be available to anyone on the tailnet. No per-site user or group restrictions are required for the MVP.
+Management clients must be tagged `tag:ts-site-client` by a tailnet
+administrator. For every `/api/*` request, the host resolves the direct socket
+peer with `tailscale whois --json` and requires that exact tag. The result is
+not cached between requests, and localhost or LAN callers are not exempt.
+`GET /api/whoami` returns the authorized device name and tags.
 
-Creating a Tailscale Service does not itself grant users access to it. The tailnet policy/ACL must permit tailnet members to reach the Service on its HTTPS port. This is an installation prerequisite and is not created implicitly by `ts-site init`.
+Sites are intended to be available to anyone on the tailnet. No per-site user
+or group restrictions are required for the MVP.
+
+Creating a Tailscale Service or assigning a device tag does not itself grant
+network access. Tailnet grants/ACLs must permit client-tagged devices to reach
+the host API port and intended members to reach each Service on its HTTPS port.
+These are installation prerequisites and are not created implicitly by
+`ts-site init`.
 
 ## Edge routing
 
@@ -111,9 +137,11 @@ Routing is isolated from storage behind a small router interface implemented in 
 - `provision(name) -> { url }` is idempotent and resolves once traffic can reach the site.
 - `deprovision(name, waitForIdle)` is idempotent, drains traffic, awaits active responses, then removes the route, and must throw on failure.
 
-The origin is plain HTTP on a local port and routes requests by Host header (`<name>.<domain>`), so any provider that can route a hostname to `127.0.0.1:<port>` is compatible. `tailscale` is the default router; `none` disables routing for local development. A future Cloudflare router would, for example, create a proxied DNS record and add a tunnel ingress rule mapping `<name>.<domain>` to the origin via the Cloudflare API, with access control handled by Cloudflare Access instead of tailnet ACLs.
+The origin is plain HTTP on a local port and routes requests by Host header (`<name>.<domain>`), so any provider that can route a hostname to `127.0.0.1:<port>` is compatible. `tailscale` is the default router; `none` disables edge provisioning but does not disable management API authorization. A future Cloudflare router would, for example, create a proxied DNS record and add a tunnel ingress rule mapping `<name>.<domain>` to the origin via the Cloudflare API, with access control handled by Cloudflare Access instead of tailnet ACLs.
 
-The host holds the only provider credentials. The CLI uses a Bearer token, required with the Tailscale router, and never talks to provider APIs.
+The host holds the only provider credentials and uses them only for edge-router
+control-plane work. The CLI stores only the host URL and never talks to
+provider APIs.
 
 ## Tailscale Service lifecycle
 
@@ -265,6 +293,8 @@ This would serve `/srv/sites/portfolio/current` directly from the daemon. The `t
 ### CLI
 
 - [x] Use Bun 1.3+ with a linked `ts-site` executable and no runtime dependencies.
+- [x] Implement `ts-site login` and secure saved-host configuration.
+- [x] Authorize every management API request with `tag:ts-site-client`.
 - [ ] Implement `ts-site init`.
 - [ ] Implement `ts-site deploy`.
 - [ ] Implement `ts-site delete` with a confirmation safeguard.
